@@ -7,15 +7,13 @@ such as an ETC and simple image simulator. pyNRC is instended to work for
 all NIRCam observing modes including direct imaging, coronagraphic imaging, 
 slitless grism spectroscopy, DHS observations, and weak lens imaging.
 All PSFs are generated via WebbPSF (https://pythonhosted.org/webbpsf/) to
-reproduce realistic JWST images and spectra.
+reproduce realistic JWST NIRCam images and spectra.
 
 Developed by Jarron Leisenring and contributors at University of AZ (2015-17).
 """
 
 
-__version__ = u'0.3'
-#__author__ = 'Jarron Leisenring'
-#__email__  = 'jarronl@email.arizona.edu'
+from .version import __version__
 
 import astropy
 from astropy import config as _config
@@ -59,7 +57,7 @@ setup_logging(conf.default_logging_level, verbose=False)
 
 from .nrc_utils import (read_filter, pix_noise, nrc_header, stellar_spectrum)
 
-from .pynrc_core import (multiaccum, DetectorOps, NIRCam, planets_sb11)
+from .pynrc_core import (multiaccum, DetectorOps, NIRCam, planets_sb11, planets_sb12)
 
 from .obs_nircam import (obs_coronagraphy, nrc_diskobs, observe_disk, observe_star)
 

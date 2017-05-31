@@ -603,10 +603,10 @@ class DetectorOps(object):
         return nrc_header(self, filter=filter, pupil=pupil, obs_time=obs_time, **kwargs)
 
 
-# Class for reading in planet spectra             
-class planets_sb11(object):
+# Class for reading in planet spectra
+class planets_sb12(object):
     """
-    Exoplanet spectrum from Spiegel & Burrows (2011)
+    Exoplanet spectrum from Spiegel & Burrows (2012)
 
     This contains 1680 files, one for each of 4 atmosphere types, each of
     15 masses, and each of 28 ages.  Wavelength range of 0.8 - 15.0 um at
@@ -614,7 +614,8 @@ class planets_sb11(object):
 
     The flux in the source files are at 10 pc. If the distance is specified,
     then the flux will be scaled accordingly. This is also true if the distance
-    is changed by the user.
+    is changed by the user. All other properties (atmo, mass, age, entropy) are 
+    not adjustable once loaded.
 
     Arguments:
         atmo: A string consisting of one of four atmosphere types:
@@ -759,6 +760,19 @@ class planets_sb11(object):
         sp.convert(fluxout)
 
         return sp
+        
+# Turns out the paper is Spiegel & Burrows (2012), not 2011
+class planets_sb11(planets_sb12):
+
+    """
+    Deprecated version of planets_sb12 class. Use that instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+                 
+        _log.warning('planets_sb11 is depcrecated. Use planets_sb12 instead.')
+        planets_sb12.__init__(self, *args, **kwargs)
+
 
 
 class NIRCam(object):
@@ -1201,7 +1215,7 @@ class NIRCam(object):
         offset_r=None, offset_theta=None, opd=None, save=None, force=False,
         **kwargs):
         """
-        Generates a set of PSF coefficients from a sequence WebbPSF images.
+        Generates a set of PSF coefficients from a sequence of WebbPSF images.
         These coefficients can then be used to generate a sequence of
         monochromatic PSFs (useful if you need to make hundreds of PSFs
         for slitless grism or DHS observations) that are subsequenty
@@ -1225,7 +1239,7 @@ class NIRCam(object):
         offset_theta : Position angle for that offset, in degrees CCW.
         opd          : Tuple containing WebbPSF specific OPD file name and slice.
         save         : Whether or not to save the resulting PSF coefficients to file.
-        force        : Forces a recalcuation of PSF even if saved PSF exists.
+        force        : Forces a recalcuation of PSFs even if saved coefficients exist.
         """
 
         if oversample is None: 
@@ -1309,12 +1323,12 @@ class NIRCam(object):
         Parameters
         ==========
         sp : A normalized Pysynphot spectrum. If not specified, the default is flat 
-            in phot lam (equal number of photons per spectral bin).
-            The default is normalized to produce 1 count/sec within that bandpass,
-            assuming the telescope collecting area and instrument bandpass. 
-            Coronagraphic PSFs will further decrease this due to the smaller pupil
-            size and coronagraphic spot. DHS and grism observations do no yet have
-            pupil size reductions accounted for.
+             in phot lam (equal number of photons per spectral bin).
+             The default is normalized to produce 1 count/sec within that bandpass,
+             assuming the telescope collecting area and instrument bandpass. 
+             Coronagraphic PSFs will further decrease this due to the smaller pupil
+             size and coronagraphic spot. DHS and grism observations do no yet have
+             pupil size reductions accounted for.
         return_oversample : If True, then also returns the oversampled version of the PSF
         use_bg_psf : If a coronagraphic observation, off-center PSF is different.
 
@@ -1839,7 +1853,7 @@ class NIRCam(object):
             ind_sort = np.lexsort((t_all['t_acq'],1/t_all['eff']))
             t_all = t_all[ind_sort]
             if verbose: 
-                print("Top 10 results sorted by 'efficiency' (SNR/t_acq):")
+                print("Top 10 results sorted by 'efficiency' [SNR/sqrt(t_acq)]:")
                 print(t_all[0:10])
         else:
             t_all = table_filter(t_all, **kwargs)
