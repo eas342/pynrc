@@ -1805,7 +1805,8 @@ class NIRCam(object):
 
         return satlim
 
-    def sensitivity(self, nsig=10, units=None, sp=None, verbose=False, **kwargs):
+    def sensitivity(self, nsig=10, units=None, sp=None, verbose=False, 
+                    use_bg_psf=True,force_full_fov=False,**kwargs):
         """Sensitivity limits.
         
         Convenience function for returning the point source (and surface brightness)
@@ -1841,6 +1842,13 @@ class NIRCam(object):
         ap_spec : int, float
             Instead of dw_bin, specify the spectral extraction aperture in pixels.
             Takes priority over dw_bin. Value will get rounded up to nearest int.
+        use_bg_psf: bool
+            Use the background PSF for the sensitivity calculation?
+            (If a coronagraphic observation, off-center PSF is different.)
+        force_full_fov : bool
+            Force sat_limits to use the full field of view?
+            Otherwise, it uses a smaller subarray to speed up computation (except
+            for weak lens calculations.
         """	
 
         quiet = False if verbose else True
@@ -1856,16 +1864,23 @@ class NIRCam(object):
 
 
         kw1 = self.multiaccum.to_dict()
-        kw2 = self._psf_info_bg
+        if use_bg_psf == True:
+            kw2 = self._psf_info_bg
+        else:
+            kw2 = self._psf_info
+        
         kw3 = {'rn':rn, 'ktc':ktc, 'idark':idark, 'p_excess':p_excess}
         kwargs = merge_dicts(kwargs,kw1,kw2,kw3)
         if 'ideal_Poisson' not in kwargs.keys():
             kwargs['ideal_Poisson'] = True
             
-        # Always use the bg coeff
-        psf_coeff = self._psf_coeff_bg
+        if use_bg_psf == True:
+            psf_coeff = self._psf_coeff_bg
+        else:
+            psf_coeff = self._psf_coeff
+        
         # We don't necessarily need the entire image, so cut down to size
-        if not ('WEAK LENS' in self.pupil):
+        if not ('WEAK LENS' in self.pupil) and not force_full_fov:
             fov_pix = 33
             fov_pix_over = fov_pix * kwargs['oversample']
             coeff = []
