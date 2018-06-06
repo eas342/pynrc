@@ -2349,7 +2349,7 @@ def bg_sensitivity(filter_or_bp, pupil=None, mask=None, module='A', pix_scale=No
         efflam = obs.efflam()*1e-4 # microns
 
         # Encircled energy
-        rho_pix = dist_image(image)
+        rho_pix = dist_image(image,center=center)
         bins = np.arange(rho_pix.min(), rho_pix.max() + 1, 1)
         # Groups indices for each radial bin
         igroups, _, rad_pix = hist_indices(rho_pix, bins, True)
