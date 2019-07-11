@@ -172,13 +172,20 @@ class NRC_refs(object):
                 else:
                     wind_mode = 'WINDOW'
             else:
+                if 'TSAMPLE' in header:
+                    tsample = header['TSAMPLE']
+                else:
+                    logging.warn("Couldn't find TSAMPLE in header, assuming 10 us")
+                    tsample = 10. ## micro s
+                
+                approxFrameTime = header['NAXIS1'] * header['NAXIS2'] * tsample * 1e-6
                 if not header['SUBARRAY']:
                     wind_mode = 'FULL'
-                elif xpix==2048:
+                elif header['TFRAME'] < 0.5 * approxFrameTime:
                     wind_mode = 'STRIPE'
                 else:
                     wind_mode = 'WINDOW'
-
+        
         # Add MultiAccum info
         if DMS: hnames = ['READPATT', 'NINTS', 'NGROUPS']  
         else:   hnames = ['READOUT',  'NINT',  'NGROUP']
