@@ -1,6 +1,30 @@
 Revision History
 ================
 
+v0.8.0beta (ongoing)
+-----------------
+
+- Release to work with WebbPSF 0.8.0.
+- Phasing out support for Python 2
+- Add info on saturation limits in terms of surface brightness 
+- Include option to create grism 2nd order
+- Detector pixel timing bugs
+- Field-dependent WFE extrapolated beyond FoV for better sampling diversity
+- Included field-dependent WFE for coronagraphy
+- Added wavelength dispersion of LW coronagraphic PSF
+
+v0.7.0 (Jun 2018)
+-----------------
+
+- Did not make it out of development before WebbPSF 0.8.0 release.
+- Works with WebbPSF 0.7.0.
+
+  - Field-dependent WFE
+  - Image plane distortions
+
+- Implemented ``jwst_backgrounds`` (not required)
+
+
 v0.6.5 (Mar 2018)
 -----------------
 
@@ -20,7 +44,7 @@ v0.6.3 (Mar 2018)
 -----------------
 
 - First PyPI release.
-- Effectively the same as 0.6.3, but better documentation of packaging and distributing.
+- Effectively the same as 0.6.2, but better documentation of packaging and distributing.
 
 
 v0.6.2 (Mar 2018)
@@ -61,7 +85,7 @@ v0.5.0 (Feb 2017)
 - ND Acquisition mode
 - Ramp settings optimizer
 - Can now simulate ramps with detector noise
-- Query Euclid's IPAC server for position-dependent Zodiacal emission
+- Query Euclid's IPAC server for time/position-dependent Zodiacal emission
 - Added example Jupyter notebooks
 
 v0.1.2 (Jan 2017)

@@ -275,7 +275,8 @@ def SCAnoise(det=None, scaid=None, params=None, caldir=None, file_out=None,
 
 def slope_to_ramp(det, im_slope=None, out_ADU=False, file_out=None, 
                   filter=None, pupil=None, obs_time=None, targ_name=None,
-                  DMS=True, dark=True, bias=True, return_results=True):
+                  DMS=True, dark=True, bias=True, det_noise=True,
+                  return_results=True):
     """Convert slope image to simulated ramp
     
     For a given detector operations class and slope image, create a
@@ -320,7 +321,18 @@ def slope_to_ramp(det, im_slope=None, out_ADU=False, file_out=None,
         Target name (optional)
     DMS : bool
         Package the data in the format used by DMS?
+    dark : bool
+        Include the dark current?
+    bias : bool
+        Include the bias frame?
+    det_noise: bool
+        Include detector noise components? If set to False, then only 
+        perform Poisson noise. Darks and biases are also excluded.
     """
+    
+    if (det_noise==False) and (im_slope is None):
+        _log.warning('No input slope image and det_noise=False. Nothing to return.')
+        return
 
     #import ngNRC
     # MULTIACCUM ramp information
@@ -354,18 +366,28 @@ def slope_to_ramp(det, im_slope=None, out_ADU=False, file_out=None,
         frame = im_slope * t_frame
         # Add Poisson noise at each frame step
         sh0, sh1 = im_slope.shape
-        new_shape = (naxis3, sh0,sh1)
+        new_shape = (naxis3, sh0, sh1)
         ramp = np.random.poisson(lam=frame, size=new_shape)#.astype(np.float64)
         # Perform cumulative sum in place
         np.cumsum(ramp, axis=0, out=ramp)
+        
+        # Truncate anything above well level
+        # TODO: Update per detector
+        well_max = det.well_level
+        ramp[ramp>well_max] = well_max
     else:
         ramp = 0
 
-    # Create dark ramp with read noise and 1/f noise
-    hdu = SCAnoise(det=det, dark=dark, bias=bias)
+    if det_noise==False:
+        hdu = fits.PrimaryHDU(ramp)
+    else:
+        # Create dark ramp with read noise and 1/f noise
+        hdu = SCAnoise(det=det, dark=dark, bias=bias)
+        # Add signal ramp to dark ramp
+        if im_slope is not None:
+            hdu.data += ramp.reshape(hdu.data.shape) 
     # Update header information
-    hdu.header = det.make_header(filter, pupil, obs_time,targ_name=targ_name,DMS=DMS)
-    hdu.data += ramp.reshape(hdu.data.shape) # Add signal ramp to dark ramp
+    hdu.header = det.make_header(filter, pupil, obs_time, targ_name=targ_name, DMS=DMS)
     data = hdu.data
 
     #### Add in IPC (TBI) ####
@@ -376,7 +398,7 @@ def slope_to_ramp(det, im_slope=None, out_ADU=False, file_out=None,
     # Convert to ADU (16-bit UINT)
     if out_ADU:
         gain = det.gain
-        data /= gain
+        data = data / gain
         data[data < 0] = 0
         data[data >= 2**16] = 2**16 - 1
         data = data.astype('uint16')
@@ -391,7 +413,7 @@ def slope_to_ramp(det, im_slope=None, out_ADU=False, file_out=None,
         data_end = data[-nf:,:,:].mean(axis=0) if nf>1 else data[-1:,:,:]
         data_end = data_end.reshape([1,ypix,xpix])
 
-        # Only care about first (n-1) groups
+        # Only care about first (n-1) groups for now
         # Last group is handled separately
         data = data[:-nf,:,:]
 
@@ -437,7 +459,238 @@ def slope_to_ramp(det, im_slope=None, out_ADU=False, file_out=None,
         outHDU = hdu
     
     if file_out is not None:
-        outHDU.writeto(file_out, clobber='True')
+        outHDU.writeto(file_out, overwrite='True')
     
     # Only return outHDU if return_results=True
-    if return_results: return outHDU
+    if return_results: 
+        return outHDU
+
+
+def add_ipc(im, alpha_min=0.0065, alpha_max=None, kernel=None):
+    """Convolve image with IPC kernel
+    
+    Given an image in electrons, apply IPC convolution
+    
+    Parameters
+    ==========
+    im : ndarray
+        Input image or array of images.
+    alpha_min : float
+        Minimum coupling coefficient between neighboring pixels.
+        If alpha_max is None, then this is taken to be constant
+        with respect to signal levels.
+    alpha_max : float or None
+        Maximum value of coupling coefficent. If specificed, then
+        coupling between pixel pairs is assumed to vary depending
+        on signal values. See Donlon et al., 2019, PASP 130.
+    kernel : ndarry or None
+        Option to directly specify the convolution kernel.
+    
+    Examples
+    ========
+    Constant Kernel
+
+        >>> im_ipc = add_ipc(im, alpha_min=0.0065)
+
+    Constant Kernel (manual)
+
+        >>> alpha = 0.0065
+        >>> k = np.array([[0,alpha,0], [alpha,1-4*alpha,alpha], [0,alpha,0]])
+        >>> im_ipc = add_ipc(im, kernel=k)
+
+    Signal-dependent Kernel
+
+        >>> im_ipc = add_ipc(im, alpha_min=0.0065, alpha_max=0.0145)
+
+    """
+
+    from astropy.convolution import convolve
+    
+    sh = im.shape
+    ndim = len(sh)
+    if ndim==2:
+        im = im.reshape([1,sh[0],sh[1]])
+        sh = im.shape
+    
+    # Pad images to have a 0 border
+    im_pad = np.pad(im, ((0,0),(1,1),(1,1)), 'constant')
+    
+    # Check for custom kernel (overrides alpha values)
+    if (kernel is not None) or (alpha_max is None):
+        # Reshape to stack all image along horizontal axes
+        im_reshape = im_pad.reshape([-1, im_pad.shape[-1]])
+    
+        if kernel is None:
+            kernel = np.array([[0.0, alpha_min, 0.0],
+                               [alpha_min, 1.-4*alpha_min, alpha_min],
+                               [0.0, alpha_min, 0.0]])
+    
+        # Convolve IPC kernel with images
+        im_ipc = convolve(im_reshape, kernel).reshape(im_pad.shape)
+    
+    # Exponential coupling strength
+    # Equation 7 of Donlon et al. (2018)
+    else:
+        arrsqr = im_pad**2
+
+        amin = alpha_min
+        amax = alpha_max
+        ascl = (amax-amin) / 2
+        
+        alpha_arr = []
+        for ax in [1,2]:
+            # Shift by -1
+            diff = np.abs(im_pad - np.roll(im_pad, -1, axis=ax))
+            sumsqr = arrsqr + np.roll(arrsqr, -1, axis=ax)
+            
+            imtemp = amin + ascl * np.exp(-diff/20000) + \
+                     ascl * np.exp(-np.sqrt(sumsqr / 2) / 10000)
+            alpha_arr.append(imtemp)
+            # Take advantage of symmetries to shift in other direction
+            alpha_arr.append(np.roll(imtemp, 1, axis=ax))
+            
+        alpha_arr = np.array(alpha_arr)
+
+        # Flux remaining in parent pixel
+        im_ipc = im_pad * (1 - alpha_arr.sum(axis=0))
+        # Flux shifted to adjoining pixels
+        for i, (shft, ax) in enumerate(zip([-1,+1,-1,+1], [1,1,2,2])):
+            im_ipc += alpha_arr[i]*np.roll(im_pad, shft, axis=ax)
+        del alpha_arr
+
+    # Trim excess
+    return im_ipc[:,1:-1,1:-1].squeeze()
+    
+    
+def add_ppc(im, ppc_frac=0.002, nchans=4, 
+    same_scan_direction=False, reverse_scan_direction=False,
+    in_place=False):
+    """ Add Post-Pixel Coupling (PPC)
+    
+    This effect is due to the incomplete settling of the analog
+    signal when the ADC sample-and-hold pulse occurs. The measured
+    signals for a given pixel will have a value that has not fully
+    transitioned to the real analog signal. Mathematically, this
+    can be treated in the same way as IPC, but with a different
+    convolution kernel.
+    
+    Parameters
+    ==========
+    im : Image or array of images
+    
+    same_scan_direction : bool
+        Are all the output channels read in the same direction?
+        By default fast-scan readout direction is ``[-->,<--,-->,<--]``
+        If ``same_scan_direction``, then all ``-->``
+    reverse_scan_direction : bool
+        If ``reverse_scan_direction``, then ``[<--,-->,<--,-->]`` or all ``<--``
+    """
+
+                       
+    sh = im.shape
+    ndim = len(sh)
+    if ndim==2:
+        im = im.reshape([1,sh[0],sh[1]])
+        sh = im.shape
+
+    nz, ny, nx = im.shape
+    chsize = nx // nchans
+    
+    # Do each channel separately
+    kernel = np.array([[0.0, 0.0, 0.0],
+                       [0.0, 1.0-ppc_frac, ppc_frac],
+                       [0.0, 0.0, 0.0]])
+                       
+    res = im if in_place else im.copy()
+    for ch in np.arange(nchans):
+        if same_scan_direction:
+            k = kernel if reverse_scan_direction else kernel[:,::-1]
+        elif np.mod(ch,2)==0:
+            k = kernel if reverse_scan_direction else kernel[:,::-1]
+        else:
+            k = kernel[:,::-1] if reverse_scan_direction else kernel
+
+        x1 = chsize*ch
+        x2 = x1 + chsize
+        res[:,:,x1:x2] = add_ipc(im[:,:,x1:x2], kernel=kernel)
+    
+                      
+    return res.squeeze()
+
+
+# npix = 20
+# arr = np.random.rand(npix) * 4000
+# arr[1] = 0
+# #arr[-1] = 2**16-1
+# 
+# pixel_time = 10. # usec
+# 
+# darr = np.roll(arr,-1) - arr
+# tarr = np.arange(100.) / pixel_time
+# tau = 1.5
+# vt = darr.reshape([-1,1])*(1-np.exp(-tarr.reshape([1,-1])/tau))
+# vt = vt.ravel()
+# 
+# arr_full = arr.repeat(len(tarr))
+# arr_new = np.roll(arr_full + vt, len(tarr))
+# 
+# tfull = np.arange(len(arr_new)) * pixel_time / len(tarr)
+# 
+# # Pixel sample times
+# t_sample = np.arange(npix)*pixel_time + 6.
+# v_sample = np.interp(t_sample, tfull, arr_new)
+# 
+# fig, ax = plt.subplots(1,1, figsize=(12,5))
+# ax.plot(tfull, arr_full)#[0:-20])
+# ax.plot(tfull, arr_new)
+# ax.xaxis.get_major_locator().set_params(nbins=9, steps=[1, 2, 5, 10])
+# 
+# fig.tight_layout()
+# 
+# from astropy.convolution import convolve
+# alpha = 0.018
+# kernel = np.array([0.0, 1-alpha, alpha])
+# arr_ppc = convolve(arr, kernel)
+# 
+# 
+# arr[1] = 0
+# arr[-1] = 2**16-1
+# # Convert to usec timestep
+# arr = arr.repeat(10)
+# 
+# from scipy.ndimage import gaussian_filter1d
+# res = gaussian_filter1d(arr, 1.5)
+# 
+# plt.clf()
+# plt.plot(arr[0:-20])
+# plt.plot(res[0:-20])
+# 
+# 
+# res = arr.copy()
+# res = res.reshape([npix,-1])
+# res[:, 0:3] = np.nan
+# res[:, -3:] = np.nan
+# res = res.ravel()
+# 
+# im_mask = np.isnan(res)
+# x = mask_helper() # Returns the nonzero (True) indices of a mask
+# res[im_mask]= np.interp(x(im_mask), x(~im_mask), res[~im_mask])
+# 
+# plt.clf()
+# plt.plot(arr[0:-20])
+# plt.plot(res[0:-20])
+# 
+# 
+# from scipy.signal import butter, filtfilt
+# b, a = butter(3, 0.2, btype='lowpass', analog=False)
+# res = filtfilt(b, a, arr)
+# 
+# from scipy.signal import savgol_filter
+# winsize = 5
+# res2 = savgol_filter(arr, winsize, 3)
+# 
+# plt.clf()
+# plt.plot(arr)
+# plt.plot(res)
+# #plt.plot(res2)
+# 

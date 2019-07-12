@@ -7,6 +7,33 @@ https://packaging.python.org/en/latest/distributing.html
 https://github.com/pypa/sampleproject
 """
 
+import glob
+import os
+import sys
+import importlib #imp
+import ast
+
+################################################################
+# astropy-helpers
+################################################################
+
+import ah_bootstrap
+#A dirty hack to get around some early import/configurations ambiguities
+if sys.version_info[0] >= 3:
+    import builtins
+else:
+    import __builtin__ as builtins
+builtins._ASTROPY_SETUP_ = True
+
+from astropy_helpers.setup_helpers import (
+    register_commands, get_debug_option, get_package_info)
+from astropy_helpers.git_helpers import get_git_devstr
+from astropy_helpers.version_helpers import generate_version_py
+
+################################################################
+# boiler plate
+################################################################
+
 # Always prefer setuptools over distutils
 from setuptools import setup, find_packages
 # To use a consistent encoding
@@ -18,7 +45,14 @@ root = path.abspath(path.dirname(__file__))
 from pynrc.version import __version__
 version = __version__
 
-import os, sys
+RELEASE = 'dev' not in version
+if not RELEASE:
+    version += get_git_devstr(False)
+
+
+################################################################
+# shortcuts for publishing, tagging, testing
+################################################################
 
 if sys.argv[-1] == 'publish':
     os.system("python setup.py sdist upload")
@@ -52,12 +86,16 @@ if sys.argv[-1] == 'test':
         modules = map(__import__, test_requirements)
     except ImportError as e:
         err_msg = e.message.replace("No module named ", "")
-        msg = "%s is not installed. Install your test requirments." % err_msg
+        msg = "%s is not installed. Install your test requirements." % err_msg
         raise ImportError(msg)
         
     print('pyNRC testing not yet implemented!!')
     os.system('py.test')
     sys.exit()
+
+################################################################
+# Package Information
+################################################################
 
 # Get the long description from the README and HISTORY files
 with open('README.rst') as readme_file:
@@ -65,18 +103,22 @@ with open('README.rst') as readme_file:
 with open('HISTORY.rst') as history_file:
     history = history_file.read()
 
-#requirements = ['Click>=6.0', ]
-requirements = ['Click>=6.0',
-          'numpy>=1.10.0',
-          'matplotlib>=1.5.0',
+requirements = [
+          'Click>=6.0',
+          'numpy>=1.15.0',
+          'matplotlib>=2',
           'scipy>=0.16.0',
-          'astropy>=1.2.0,<3.0',
-          'pysynphot>=0.9',
-          'poppy>=0.6.1',
-          'webbpsf>=0.6.0',
-          'jwxml>=0.3.0',
-#          'jwst_backgrounds>=1.1',
+          'pysynphot>=0.9.7',
+          'poppy>=0.7.0',
+          'webbpsf>=0.7.0',
       ]
+# RTD cannot handle certain 
+# if not (os.environ.get('READTHEDOCS') == 'True'):
+#     # requirements.append('jwst_backgrounds>=1.1')
+#     requirements.append('astropy>=2.0,<3.0')
+# else:
+#     requirements.append('astropy>=2.0')
+    
 
 setup_requirements = ['pytest-runner', ]
 
@@ -93,7 +135,8 @@ setup(
     long_description=readme + '\n\n' + history,
 
     # The project's main homepage.
-    url='https://github.com/JarronL/pynrc',
+    #url='https://github.com/JarronL/pynrc',
+    url='https://pynrc.readthedocs.io',
 
     # Author details
     author='Jarron Leisenring',
@@ -118,11 +161,12 @@ setup(
 
         # Specify the Python versions you support here. In particular, ensure
         # that you indicate whether you support Python 2, Python 3 or both.
-        'Programming Language :: Python :: 2',
-        'Programming Language :: Python :: 2.7',
+        #'Programming Language :: Python :: 2',
+        #'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
     ],
 
     # You can just specify the packages manually here if your project is

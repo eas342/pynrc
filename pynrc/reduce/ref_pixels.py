@@ -11,6 +11,7 @@ import numpy as np
 import pynrc
 from pynrc.maths import robust
 #from pynrc.maths import nrc_utils
+from scipy.signal import savgol_filter
 
 #from . import *
 #from .nrc_utils import *
@@ -81,7 +82,7 @@ class NRC_refs(object):
     
     """
 
-    def __init__(self, data, header, DMS=False, altcol=True, do_all=False):
+    def __init__(self, data, header, DMS=False, altcol=True, do_all=False, **kwargs):
     
         # Convert to float if necessary
         if 'float' not in data.dtype.name:
@@ -109,7 +110,7 @@ class NRC_refs(object):
         self.altcol = altcol            
 
         # Create a detector class
-        self._create_detops()
+        self._create_detops(**kwargs)
 
         # Reference info from header
         self.nref_t = self.header['TREFROW']
@@ -137,8 +138,8 @@ class NRC_refs(object):
             self.calc_col_smooth()
             self.correct_col_refs()
         
-    def _create_detops(self, read_mode=None, nint=None, ngroup=None,
-        detector=None, wind_mode=None, xpix=None, ypix=None, x0=None, y0=None):
+    def _create_detops(self, read_mode=None, nint=None, ngroup=None, detector=None, 
+        wind_mode=None, xpix=None, ypix=None, x0=None, y0=None, **kwargs):
         """
         Create a detector class based on header settings.
         """
@@ -162,22 +163,19 @@ class NRC_refs(object):
             y1 = header['SUBSTRT2'] if DMS else header['ROWCORNR']
             y0 = y1 - 1
             
-        # Subarray setting, Full, Stripe, or Window
+        # Subarray setting: Full, Stripe, or Window
         if wind_mode is None:
-            if DMS:
-                if 'FULL' in header['SUBARRAY']:
-                    wind_mode = 'FULL'
-                elif 'GRISM' in header['SUBARRAY']:
-                    wind_mode = 'STRIPE'
-                else:
-                    wind_mode = 'WINDOW'
+            if DMS and ('FULL' in header['SUBARRAY']):
+                wind_mode = 'FULL'
+            elif (not DMS) and (not header['SUBARRAY']):
+                wind_mode = 'FULL'
             else:
-                if not header['SUBARRAY']:
-                    wind_mode = 'FULL'
-                elif xpix==2048:
-                    wind_mode = 'STRIPE'
-                else:
-                    wind_mode = 'WINDOW'
+                # Test if STRIPE or WINDOW
+                det_stripe = pynrc.DetectorOps(detector, 'STRIPE', xpix, ypix, x0, y0)
+                det_window = pynrc.DetectorOps(detector, 'WINDOW', xpix, ypix, x0, y0)
+                dt_stripe = np.abs(header['TFRAME'] - det_stripe.time_frame)
+                dt_window = np.abs(header['TFRAME'] - det_window.time_frame)
+                wind_mode = 'STRIPE' if dt_stripe<dt_window else 'WINDOW'
 
         # Add MultiAccum info
         if DMS: hnames = ['READPATT', 'NINTS', 'NGROUPS']  
@@ -278,7 +276,9 @@ class NRC_refs(object):
     
         # Check to make sure refs_amps_avg is valid
         if (self.refs_amps_avg is None):
-            raise ValueError('self.refs_amps_avg is set to None')
+            _log.warning('self.refs_amps_avg is set to None. No offsets applied.')
+            return
+            #raise ValueError('self.refs_amps_avg is set to None')
 
         # Supermean
         # the average of the average is the DC level of the output channel
@@ -337,7 +337,7 @@ class NRC_refs(object):
         self.refs_side_avg = calc_avg_cols(rl, rr, avg_type)
                     
 
-    def calc_col_smooth(self, perint=False, edge_wrap=False):
+    def calc_col_smooth(self, perint=False, edge_wrap=False, savgol=False, **kwargs):
         """Optimal smoothing of side reference pixels
         
         Geneated smoothed version of column reference values.
@@ -357,7 +357,9 @@ class NRC_refs(object):
 
         # Check to make sure refs_amps_avg1 and refs_amps_avg2 are valid
         if refvals is None:
-            raise ValueError('self.refs_side_avg set to None')
+            _log.warning('self.refs_side_avg is set to None. No smoothing applied.')
+            return
+            #raise ValueError('self.refs_side_avg set to None')
         
         # Time to go through an entire row.
         # The delta time does't seem to make any difference in the final data product
@@ -367,8 +369,9 @@ class NRC_refs(object):
         
         # Save smoothed values
         self.refs_side_smth = calc_col_smooth(refvals, self.data.shape, \
-                                              perint, edge_wrap, delt)
-
+                                              perint=perint, edge_wrap=edge_wrap, 
+                                              delt=delt, savgol=savgol, **kwargs)
+    
     def correct_col_refs(self):
         """Remove 1/f noise from data
         
@@ -399,7 +402,7 @@ def reffix_hxrg(cube, nchans=4, in_place=True, fixcol=False, **kwargs):
         Perform calculations in place. Input array is overwritten.
     nchans : int
         Number of output amplifier channels in the detector. Default=4.
-    fix_col : bool
+    fixcol : bool
         Perform reference column corrections?
         
     Keyword Args
@@ -426,11 +429,21 @@ def reffix_hxrg(cube, nchans=4, in_place=True, fixcol=False, **kwargs):
     nright : int
         Specify the number of right reference columns.
     perint : bool
-        Smooth side reference pixel per integration, 
-        otherwise do frame-by-frame.
+        Smooth side reference pixel per integration, otherwise do frame-by-frame.
     avg_type :str
-        Type of ref col averaging to perform. Allowed values are
-        'pixel', 'frame', or 'int'.    
+        Type of side column averaging to perform to determine ref pixel drift. 
+        Allowed values are 'pixel', 'frame', or 'int':
+            * 'int'   : Subtract the avg value of all side ref pixels in ramp.
+            * 'frame' : For each frame, get avg of side ref pixels and subtract framewise.
+            * 'pixel' : For each ref pixel, subtract its avg value from all frames.
+
+    savgol : bool
+        Using Savitsky-Golay filter method rather than FFT.
+    winsize : int
+        Size of the window filter.
+    order : int
+        Order of the polynomial used to fit the samples.
+
     """
 
     # Check the number of dimensions are valid.
@@ -448,11 +461,11 @@ def reffix_hxrg(cube, nchans=4, in_place=True, fixcol=False, **kwargs):
         cube = np.copy(cube)
 
     # Remove channel offsets
-    cube = reffix_amps(cube, in_place=True, **kwargs)
+    cube = reffix_amps(cube, nchans=nchans, in_place=True, **kwargs)
 
     # Fix 1/f noise using vertical reference pixels
     if fixcol:
-        cube = ref_filter(cube, in_place=True, **kwargs)
+        cube = ref_filter(cube, nchans=nchans, in_place=True, **kwargs)
 
     return cube
     
@@ -534,7 +547,7 @@ def reffix_amps(cube, nchans=4, in_place=True, altcol=True, supermean=False,
     smean = robust.mean(refs_all) if supermean else 0.0
     
     # Calculate avg reference values for each frame and channel
-    refs_amps_avg = calc_avg_amps(refs_all, cube.shape, nchans=4, altcol=True)
+    refs_amps_avg = calc_avg_amps(refs_all, cube.shape, nchans=nchans, altcol=altcol)
         
     for ch in range(nchans):
         # Channel indices
@@ -553,8 +566,8 @@ def reffix_amps(cube, nchans=4, in_place=True, altcol=True, supermean=False,
     # Add back supermean
     if supermean: cube += smean
 
-    if ndim==2: return cube[0]
-    else: return cube
+    cube = cube.squeeze()
+    return cube
 
 
 def ref_filter(cube, nchans=4, in_place=True, avg_type='frame', perint=False, 
@@ -589,6 +602,15 @@ def ref_filter(cube, nchans=4, in_place=True, avg_type='frame', perint=False,
         Specify the number of left reference columns.
     nright : int
         Specify the number of right reference columns.
+
+    Keyword Arguments
+    =================
+    savgol : bool
+        Using Savitsky-Golay filter method rather than FFT.
+    winsize : int
+        Size of the window filter.
+    order : int
+        Order of the polynomial used to fit the samples.
     """               
            
     if not in_place:
@@ -626,12 +648,14 @@ def ref_filter(cube, nchans=4, in_place=True, avg_type='frame', perint=False,
     # The delta time does't seem to make any difference in the final data product
     # Just for vizualization purposes...
     delt = 10E-6 * (nx/nchans + 12.)
-    refvals_smoothed = calc_col_smooth(refvals, cube.shape, perint, edge_wrap, delt)
+    refvals_smoothed = calc_col_smooth(refvals, cube.shape, perint=perint, 
+        edge_wrap=edge_wrap, delt=delt, **kwargs)
     
     # Final correction
     #for i,im in enumerate(cube): im -= refvals_smoothed[i].reshape([ny,1])
     cube -= refvals_smoothed.reshape([nz,ny,1])
 
+    cube = cube.squeeze()
     return cube
 
     
@@ -711,8 +735,11 @@ def calc_avg_cols(refs_left=None, refs_right=None, avg_type='frame'):
     refs_right : ndarray
         Right reference columns.
     avg_type : str
-        Type of ref col averaging to perform. Allowed values are
-        'pixel', 'frame', or 'int'.
+        Type of ref column averaging to perform to determine ref pixel variation. 
+        Allowed values are 'pixel', 'frame', or 'int'.
+        'pixel' : For each ref pixel, subtract its avg value from all frames.
+        'frame' : For each frame, get avg ref pixel values and subtract framewise.
+        'int'   : Calculate avg of all ref pixels within the ramp and subtract.
 
     """
     
@@ -777,7 +804,8 @@ def calc_avg_cols(refs_left=None, refs_right=None, avg_type='frame'):
 
 
 
-def calc_col_smooth(refvals, data_shape, perint=False, edge_wrap=False, delt=5.24E-4):
+def calc_col_smooth(refvals, data_shape, perint=False, edge_wrap=False, 
+    delt=5.24E-4, savgol=False, winsize=31, order=3, **kwargs):
     """Perform optimal smoothing of side ref pix
     
     Geneated smoothed version of column reference values.
@@ -787,15 +815,24 @@ def calc_col_smooth(refvals, data_shape, perint=False, edge_wrap=False, delt=5.2
     ----------
     refvals : ndarray
         Averaged column reference pixels
-    data_shape : 
+    data_shape : tuple
         Shape of original data (nz,ny,nx)
+        
+    Keyword Arguments
+    =================
     perint : bool
         Smooth side reference pixel per int, otherwise per frame.
     edge_wrap : bool
         Add a partial frames to the beginning and end of each averaged
-        time seires pixels in order to get rid of edge effects.
+        time series pixels in order to get rid of edge effects.
     delt : float
         Time between reference pixel samples. 
+    savgol : bool
+        Using Savitsky-Golay filter method rather than FFT.
+    winsize : int
+        Size of the window filter.
+    order : int
+        Order of the polynomial used to fit the samples.
     """
     
     nz,ny,nx = data_shape
@@ -803,23 +840,41 @@ def calc_col_smooth(refvals, data_shape, perint=False, edge_wrap=False, delt=5.2
     # May want to revisit the do-all-at-once or break-up decision
     # This may depend on preamp reset per frame or per integration
     # For now, we'll do it frame-by-frame by default (perint=False)
-    if perint:
+    if perint: # per integration
         if edge_wrap: # Wrap around to avoid edge effects
             refvals2 = np.vstack((refvals[0][::-1], refvals, refvals[-1][::-1]))
-            refvals_smoothed2 = smooth_fft(refvals2, delt)
+            if savgol: # SavGol filter
+                refvals_smoothed2 = savgol_filter(refvals2.ravel(), winsize, order, delta=1)
+            else: # Or "optimal" smoothing algorithm
+                refvals_smoothed2 = smooth_fft(refvals2, delt)
             refvals_smoothed = refvals_smoothed2[ny:-ny].reshape(refvals.shape)
         else:
-            refvals_smoothed = smooth_fft(refvals, delt).reshape(refvals.shape)
+            if savgol:
+                refvals_smoothed = savgol_filter(refvals.ravel(), winsize, order, delta=1)
+            else:
+                refvals_smoothed = smooth_fft(refvals, delt)
+            refvals_smoothed = refvals_smoothed.reshape(refvals.shape)
+
+
     else:
+        refvals_smoothed = []
         if edge_wrap: # Wrap around to avoid edge effects
-            refvals_smoothed = []
             for ref in refvals:
-                ref2 = np.concatenate((ref[:ny/2][::-1], ref, ref[ny/2:][::-1]))
-                ref_smth = smooth_fft(ref2, delt)
-                refvals_smoothed.append(ref_smth[ny/2:ny/2+ny])
+                ref2 = np.concatenate((ref[:ny//2][::-1], ref, ref[ny//2:][::-1]))
+                if savgol:
+                    ref_smth = savgol_filter(ref2, winsize, order, delta=1)
+                else:
+                    ref_smth = smooth_fft(ref2, delt)
+                refvals_smoothed.append(ref_smth[ny//2:ny//2+ny])
             refvals_smoothed = np.array(refvals_smoothed)
         else:
-            refvals_smoothed = np.array([smooth_fft(ref, delt) for ref in refvals])
+            for ref in refvals:
+                if savgol:
+                    ref_smth = savgol_filter(ref, winsize, order, delta=1)
+                else: 
+                    ref_smth = smooth_fft(ref, delt)
+                refvals_smoothed.append(ref_smth)
+            refvals_smoothed = np.array(refvals_smoothed)
     
     return refvals_smoothed
 
@@ -978,7 +1033,300 @@ def smooth_fft(data, delt, first_deriv=False, second_deriv=False):
         return Smoothed_Data
     
 
-#def extract_pink(im, nchans=4, chmed=True, chflip=True, method='savgol'):
-#
-#    ny, nx = im.shape
-#    chsize = nx / nchans
+def channel_averaging(im, nchans=4, same_scan_direction=False, off_chans=True, 
+    mn_func=np.nanmedian, **kwargs):
+    """Estimate common 1/f noise in image
+
+    For a given image, average the channels together to find 
+    the common pattern noise present within the channels.
+    Returns an array the same size as the input image.
+
+    Parameters
+    ==========
+    im : ndarray
+        Input image
+
+    Keyword Args
+    ============
+    nchans : int
+        Number of output channels
+    same_scan_direction : bool
+        Are all the output channels read in the same direction?
+        By default fast-scan readout direction is ``[-->,<--,-->,<--]``
+        If ``same_scan_direction``, then all ``-->``
+    off_chans : bool
+        Calculate indepenent values for each channel using the off channels.
+    mn_func : function
+        What function should we use to calculate the average.
+        Default `np.nanmedian`
+
+    """
+
+    ny, nx = im.shape
+    chsize = int(nx / nchans)
+
+    # Reshape to [ny,chsize,nchans]
+    im = im.reshape(ny,nchans,chsize).transpose([0,2,1])
+
+    # Flip channels if they're reversed
+    if same_scan_direction==False:
+        for ch in range(nchans):
+            if np.mod(ch,2)==1: im[:,:,ch] = im[:,::-1,ch]
+                
+    if off_chans == False:
+        im = im.reshape([-1,nchans])
+        ch_mn = mn_func(im, axis=1).reshape([ny,chsize])
+        im = im.reshape([ny,chsize,nchans])
+
+    arr_list = []
+    ind_chans = np.arange(nchans)
+    for ch in range(nchans):
+
+        # Take median of other channels
+        if off_chans:
+            ind_off = np.where(ind_chans != ch)[0]
+            im_off_chans = im[:,:,ind_off].reshape([-1,nchans-1])
+            ch_mn = mn_func(im_off_chans, axis=1).reshape([ny,chsize])
+        
+        # Consecutive outputs reversed?
+        if (np.mod(ch,2) == 0) or (same_scan_direction == True): 
+            arr_list.append(ch_mn)
+        else: 
+            arr_list.append(ch_mn[:,::-1])
+#    im = im.reshape([ny,chsize,nchans]).transpose([0,2,1]).reshape([ny,nx])
+            
+    return np.concatenate(arr_list, axis=1)
+
+
+def channel_smooth_fft(im_arr, winsize=64):
+    """Channel smoothing using smooth_fft
+
+    Function for generating a map of the 1/f noise within a series of input images.
+    The input images should show some clear noise structure for this to be useful.
+    Uses M. Robberto smoothing algorithm.
+
+    One might prefer the `channel_smooth_savgol` or `channel_smooth_butter`
+    functions due to their quickness.
+
+    Parameters
+    ==========
+    im_arr : ndarray
+        Input array of images
+    winsize : int
+        Window size chunks to break up 
+    """
+
+    sh = im_arr.shape
+    if len(sh)==2:
+        nz = 1
+        ny, chsize = sh
+    else:
+        nz, ny, chsize = sh
+
+    # Check that winsize is even
+    winsize = winsize+1 if winsize % 2 == 1 else winsize
+
+    # Reshape in case of nz=1
+    im_arr = im_arr.reshape([nz, -1])
+
+    res_arr = []
+    excess = winsize #int(winsize / 2)
+    for im in im_arr:
+        nwin = int(im.size / winsize) + 1
+        # Add some extra values to beginning and end to remove edge effects
+        im2 = np.concatenate((im[:excess][::-1], im, im[-excess:][::-1]))
+
+        res = []
+        for i in range(nwin):
+            i1 = 0 if i==0 else winsize*i
+            i2 = i1 + winsize + 2*excess
+            vals = im2[i1:i2]
+
+            # If smooth_fft fails, then just take median
+            # Failing generally means the distribution is consistent with white noise
+            try:
+                vals_smooth = smooth_fft(vals, 10e-6)
+                # Trim edges
+                vals_smooth = vals_smooth[excess:excess+winsize]
+            except:
+                vals_smooth = np.zeros(winsize) + np.nanmedian(vals)
+            res.append(vals_smooth)
+        res = np.array(res).ravel()[0:im.size]
+        res_arr.append(res.reshape([ny,-1]))
+
+    return np.array(res_arr).squeeze()
+
+def mask_helper():
+    """Helper to handle indices and logical indices of a mask.
+
+    Output:
+        - index, a function, with signature indices = index(logical_indices),
+          to convert logical indices of a mask to 'equivalent' indices
+    Example:
+        >>> # linear interpolation of NaNs
+        >>> mask = np.isnan(y)
+        >>> x = mask_helper(y)
+        >>> y[mask]= np.interp(x(mask), x(~mask), y[~mask])
+    """
+
+    return lambda z: np.nonzero(z)[0]
+
+def channel_smooth_savgol(im_arr, winsize=31, order=3, per_line=False, 
+    mask=None, **kwargs):
+    """Channel smoothing using savgol filter
+
+    Parameters
+    ==========
+    im_arr : ndarray
+        Input array of images (intended to be a cube of output channels). 
+        Each image is operated on separately. If only two dimensions,
+        then only a single input image is assumed. NaN's will be
+        interpolated over.
+
+    Keyword Args
+    ============
+    winsize : int
+        Size of the window filter.
+    order : int
+        Order of the polynomial used to fit the samples.
+    per_line : bool
+        Smooth each channel line separately with the hopes of avoiding
+        edge discontinuities.
+    mask : bool image or None
+        An image mask of pixels to ignore. Should be same size as im_arr.
+        This can be used to mask pixels that the filter should ignore, 
+        such as stellar sources or pixel outliers.
+    mode : str
+        Must be 'mirror', 'constant', 'nearest', 'wrap' or 'interp'.  This
+        determines the type of extension to use for the padded signal to
+        which the filter is applied.  When `mode` is 'constant', the padding
+        value is given by `cval`. 
+        When the 'interp' mode is selected (the default), no extension
+        is used.  Instead, a degree `polyorder` polynomial is fit to the
+        last `window_length` values of the edges, and this polynomial is
+        used to evaluate the last `window_length // 2` output values.
+    cval : float
+        Value to fill past the edges of the input if `mode` is 'constant'.
+        Default is 0.0.
+    """
+
+    sh = im_arr.shape
+    if len(sh)==2:
+        nz = 1
+        ny, chsize = sh
+    else:
+        nz, ny, chsize = sh
+
+    # Check that winsize is odd
+    winsize = winsize-1 if winsize % 2 == 0 else winsize
+
+    # Reshape in case of nz=1
+    im_arr = im_arr.reshape([nz, -1])
+
+    res_arr = []
+    for i, im in enumerate(im_arr):
+        # im should be a 1D array
+
+        # Interpolate over masked data and NaN's
+        nans = np.isnan(im)
+        im_mask = nans if mask is None else nans | mask[i].flatten()
+        if im_mask.any():
+            # Create a copy so as to not change the original data
+            im = np.copy(im)
+
+            # Use a savgol filter to smooth out any outliers
+            res = im.copy()
+            res[~im_mask] = savgol_filter(im[~im_mask], 31, 3, mode='interp')
+
+            # Replace masked pixels with linear interpolation
+            x = mask_helper() # Returns the nonzero (True) indices of a mask
+            im[im_mask]= np.interp(x(im_mask), x(~im_mask), res[~im_mask])
+
+        if per_line:
+            im = im.reshape([ny,-1])
+
+            res = savgol_filter(im, winsize, order, axis=1, delta=1, **kwargs)
+            res_arr.append(res)
+        else:
+            res = savgol_filter(im, winsize, order, delta=1, **kwargs)
+            res_arr.append(res.reshape([ny,-1]))
+
+    return np.array(res_arr).squeeze()
+
+
+def channel_smooth_butter(im_arr, order=3, freq=0.1, per_line=False, mask=None):
+    """Channel smoothing using Butterworth filter
+
+    Parameters
+    ==========
+    im_arr : ndarray
+        Input array of images (intended to be a cube of output channels). 
+        Each image is operated on separately. If only two dimensions,
+        then only a single input image is assumed.
+
+    Keyword Args
+    ============
+    order : int
+        Order of the filter (high order have sharper frequency cut-off)
+    freq : float
+        Normalized frequency cut-off (between 0 and 1). 1 is Nyquist.
+    per_line : bool
+        Smooth each channel line separately with the hopes of avoiding
+        edge discontinuities.
+    mask : bool image or None
+        An image mask of pixels to ignore. Should be same size as im_arr.
+        This can be used to mask pixels that the filter should ignore, 
+        such as stellar sources or pixel outliers.
+    """
+
+    from scipy.signal import butter, filtfilt, savgol
+
+    sh = im_arr.shape
+    if len(sh)==2:
+        nz = 1
+        ny, chsize = sh
+    else:
+        nz, ny, chsize = sh
+
+    # Reshape in case of nz=1
+    im_arr = im_arr.reshape([nz, -1])
+
+    res_arr = []
+    b, a = butter(order, freq, btype='lowpass', analog=False)
+    for i, im in enumerate(im_arr):
+        # im should be a 1D array
+
+        # Interpolate over masked data and NaN's
+        # Replace masked pixels with linear interpolation
+        nans = np.isnan(im)
+        im_mask = nans if mask is None else nans | mask[i].flatten()
+        if im_mask.any():
+            # Create a copy so as to not change the original data
+            im = np.copy(im)
+
+            # Use a savgol filter to smooth out any outliers
+            res = im.copy()
+            res[~im_mask] = savgol_filter(im[~im_mask], 31, 3, mode='interp')
+
+            # Replace masked pixels with linear interpolation
+            x = mask_helper() # Returns the nonzero (True) indices of a mask
+            im[im_mask]= np.interp(x(im_mask), x(~im_mask), res[~im_mask])
+
+        # Do filter line-by-line
+        if per_line:
+            im = im.reshape([ny,-1])
+
+            res_lines = []
+            for line in im:
+                res = filtfilt(b, a, line)
+                res_lines.append(res)
+            res_lines = np.array(res_lines)
+            res_arr.append(res_lines.reshape([ny,-1]))
+        else:
+            res = filtfilt(b, a, im)
+            res_arr.append(res.reshape([ny,-1]))
+
+    return np.array(res_arr).squeeze()
+
+
+

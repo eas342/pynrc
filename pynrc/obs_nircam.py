@@ -1,7 +1,7 @@
 from __future__ import division, print_function, unicode_literals
 
 from astropy.convolution import convolve, convolve_fft
-from astropy.convolution import Gaussian2DKernel, Gaussian1DKernel
+from astropy.convolution import Gaussian1DKernel, Gaussian2DKernel
 from scipy.ndimage.interpolation import rotate
 from scipy import fftpack
 from copy import deepcopy
@@ -43,7 +43,6 @@ class nrc_hci(NIRCam):
         if 'STRIPE' in wind_mode: xpix = 2048
 
         #super(NIRCam,self).__init__(**kwargs)
-        # Not sure if this works for both Python 2 and 3
         NIRCam.__init__(self, wind_mode=wind_mode, xpix=xpix, ypix=ypix, **kwargs)
 
         # Background/off-axis PSF coeff updates
@@ -61,8 +60,33 @@ class nrc_hci(NIRCam):
         # Cached PSFs
         # -----------
         # Generate cached PSFs for quick retrieval.
+        # A PSF centered on the mask and one fully off-axis.
         if verbose: print("Generating oversampled PSFs...")
+        self._gen_cached_psfs()
+
+        # Set locations based on detector
+        self._set_xypos()
+        # Create mask throughput images seen by each detector
+        self._gen_cmask()
+
+
+    @property
+    def wfe_drift(self):
+        """WFE drift relative to nominal PSF (nm)"""
+        return self._wfe_drift
+    @wfe_drift.setter
+    def wfe_drift(self, value):
+        """Set the WFE drift value and update coefficients"""
+        # Only update if the value changes
+        vold = self._wfe_drift; self._wfe_drift = value
+        if vold != self._wfe_drift: 
+            self.update_psf_coeff(wfe_drift=self._wfe_drift)
+            self._gen_cached_psfs()
+
+    def _gen_cached_psfs(self):
+        """Generate a set of cached PSF for quick retrieval."""
         if self.mask is None:
+            # If no mask center and bg and off-axis PSFs are all the same
             _, psf = self.gen_psf(return_oversample=True, use_bg_psf=False)
             self.psf_center_over = psf
             self.psf_offaxis_over = self.psf_center_over
@@ -76,6 +100,7 @@ class nrc_hci(NIRCam):
             self._gen_psfbar_list()
             _, psf = self.gen_psf(return_oversample=True, use_bg_psf=True)
             self.psf_offaxis_over = psf
+
 
     def gen_offset_psf(self, offset_r, offset_theta, sp=None, return_oversample=False):
         """Create a PSF offset from center FoV
@@ -103,6 +128,8 @@ class nrc_hci(NIRCam):
         """
 
         if sp is None:
+            # No spectral information, so use cached PSFs
+            # Let _psf_lin_comb() handle it
             psf_center  = None #self.psf_center_over
             psf_offaxis = None #self.psf_offaxis_over
         else:
@@ -138,8 +165,7 @@ class nrc_hci(NIRCam):
         Linearly combine off-axis and occulted PSFs.
         Returns an oversampled PSF.
 
-        If passing the two PSFs, make sure they are the oversampled
-        versions.
+        If passing the two PSFs, make sure they are the oversampled versions.
 
         Parameters
         ----------
@@ -211,7 +237,7 @@ class nrc_hci(NIRCam):
             yv = (np.arange(ny) - ny/2) * pixscale_over
             a = np.interp(offy_asec, yv, mask_cut**2)
             b = 1 - a
-
+            
             res = psf_offaxis*a + psf_center*b
 
         return res
@@ -243,6 +269,7 @@ class nrc_hci(NIRCam):
 
         # Original offset value for observation
         baroff_orig = self.bar_offset
+        self._bar_wfe_val = baroff_orig
 
         # Loop through offset locations and save PSFs
         psf_list = []
@@ -254,10 +281,78 @@ class nrc_hci(NIRCam):
 
         # Return to original bar offset position
         self.bar_offset = baroff_orig
+        self._bar_wfe_val = None
 
         self.psf_center_offsets = offset_vals
         self.psf_center_over = psf_list
 
+    def _set_xypos(self):
+        """
+        Set x0 and y0 subarray positions.
+        """
+
+        wind_mode = self.det_info['wind_mode']
+        if self.mask is not None:
+            full = True if 'FULL' in wind_mode else False
+            cdict = coron_ap_locs(self.module, self.channel, self.mask, full=full)
+            xcen, ycen = cdict['cen']
+
+            xpix, ypix = (self.det_info['xpix'], self.det_info['ypix'])
+            if full: 
+                x0, y0 = (0,0)
+            else: 
+                x0, y0 = (int(xcen-xpix/2), int(ycen-ypix/2))
+
+            # Make sure subarray sizes don't push out of bounds
+            if (y0 + ypix) > 2048: 
+                y0 = 2048 - ypix
+            if (x0 + xpix) > 2048: 
+                x0 = 2048 - xpix
+
+            self.update_detectors(x0=x0, y0=y0)
+            
+    def get_psf_cen(self):
+        """
+        Determine center of mask where PSF is placed.
+        """
+        bar_offpix = self.bar_offset / self.pixelscale
+        if ('FULL' in self.det_info['wind_mode']) and (self.mask is not None):
+            cdict = coron_ap_locs(self.module, self.channel, self.mask, full=True)
+            xcen, ycen = cdict['cen_sci']
+            xcen += bar_offpix
+        else:
+            ypix, xpix = (self.det_info['ypix'], self.det_info['xpix'])
+            xcen, ycen = (xpix/2 + bar_offpix, ypix/2)
+            
+        return (xcen, ycen)          
+
+    def _gen_cmask(self, oversample=1):
+        """
+        Generate coronagraphic mask transmission images.
+
+        Output images are in V2/V3 coordinates.
+        """
+        mask = self.mask
+        module = self.module
+        pixscale = self.pix_scale
+        wind_mode = self.det_info['wind_mode']
+
+        mask_dict = {}
+        for det in self.Detectors:
+            detid = det.detid
+
+            if mask is None:
+                mask_dict[detid] = None
+            elif 'FULL' in wind_mode:
+                mask_dict[detid] = build_mask_detid(detid, oversample, mask)
+            else:
+                fov = np.max([det.xpix, det.ypix]) * pixscale
+                im = coron_trans(mask, module=module, pixscale=pixscale,
+                                 fov=fov, nd_squares=True)
+                im = pad_or_cut_to_size(im, (det.ypix,det.xpix))
+                mask_dict[detid] = im
+
+        self.mask_images = mask_dict
 
 
 
@@ -289,7 +384,7 @@ class obs_hci(nrc_hci):
     wfe_ref_drift: float
         WFE drift in nm between the science and reference targets.
         Expected values are between ~3-10 nm.
-    wfe_ref_drift: float
+    wfe_roll_drift: float
         WFE drift in nm between science roll angles. Default=0.
     wind_mode : str
         'FULL', 'STRIPE', or 'WINDOW'
@@ -353,11 +448,6 @@ class obs_hci(nrc_hci):
 
         self._gen_ref(verbose=verbose)
 
-        # Set locations based on detector
-        self._set_xypos()
-        # Create mask throughput images seen by each detector
-        self._gen_cmask()
-
         # Rescale input disk image to observation parameters
         self._disk_hdulist_input = disk_hdu
         self._gen_disk_hdulist()
@@ -419,7 +509,7 @@ class obs_hci(nrc_hci):
             hdr = disk_hdul[0].header
 
             # Get rid of the central star flux
-            # and anything interior to a few pixls
+            # and anything interior to a few pixels
             image = disk_hdul[0].data
             image_rho = dist_image(image)
             image[image_rho < 4] = 0
@@ -432,7 +522,10 @@ class obs_hci(nrc_hci):
             hdulist_out = image_rescale(disk_hdul, args_in, args_out, cen_star=False)
 
             # Expand to full observation size
-            hdulist_out[0].data = pad_or_cut_to_size(hdulist_out[0].data, (ypix,xpix))
+            ydata, xdata = hdulist_out[0].data.shape
+            ynew = np.max([ypix, ydata])
+            xnew = np.max([xpix, xdata])
+            hdulist_out[0].data = pad_or_cut_to_size(hdulist_out[0].data, (ynew,xnew))
             self.disk_hdulist = hdulist_out
 
 
@@ -488,55 +581,6 @@ class obs_hci(nrc_hci):
             self.psf_list = [self.gen_offset_psf(offset, 0) for offset in self.offset_list]
             self.bar_offset = baroff_orig
 
-    def _set_xypos(self):
-        """
-        Set x0 and y0 subarray positions.
-        """
-
-        wind_mode = self.det_info['wind_mode']
-        if self.mask is not None:
-            full = True if 'FULL' in wind_mode else False
-            cdict = coron_ap_locs(self.module, self.channel, self.mask, full=full)
-            xcen, ycen = cdict['cen']
-
-            xpix, ypix = (self.det_info['xpix'], self.det_info['ypix'])
-            if full: x0, y0 = (0,0)
-            else: x0, y0 = (int(xcen-xpix/2), int(ycen-ypix/2))
-
-            # Make sure subarray sizes don't push out of bounds
-            if (y0 + ypix) > 2048: y0 = 2048 - ypix
-            if (x0 + xpix) > 2048: x0 = 2048 - xpix
-
-            self.update_detectors(x0=x0, y0=y0)
-
-    def _gen_cmask(self, oversample=1):
-        """
-        Generate coronagraphic mask transmission images.
-
-        Output images are in V2/V3 coordinates.
-        """
-        mask = self.mask
-        module = self.module
-        pixscale = self.pix_scale
-        wind_mode = self.det_info['wind_mode']
-
-        mask_dict = {}
-        for det in self.Detectors:
-            detid = det.detid
-
-            if mask is None:
-                mask_dict[detid] = None
-            elif 'FULL' in wind_mode:
-                mask_dict[detid] = build_mask_detid(detid, oversample, mask)
-            else:
-                fov = np.max([det.xpix, det.ypix]) * pixscale
-                im = coron_trans(mask, module=module, pixscale=pixscale,
-                                 fov=fov, nd_squares=True)
-                im = pad_or_cut_to_size(im, (det.ypix,det.xpix))
-                mask_dict[detid] = im
-
-        self.mask_images = mask_dict
-
     def planet_spec(self, Av=0, **kwargs):
         """Exoplanet spectrum.
 
@@ -561,7 +605,7 @@ class obs_hci(nrc_hci):
             Initial entropy (8.0-13.0) in increments of 0.25
 
         accr : bool
-            Include accretion (default: False)?
+            Include accretion? Default: False.
         mmdot : float
             From Zhu et al. (2015), the Mjup^2/yr value.
             If set to None then calculated from age and mass.
@@ -597,7 +641,7 @@ class obs_hci(nrc_hci):
         source image using a spectrum from Spiegel & Burrows (2012).
         Use self.kill_planets() to delete them.
 
-        Coordinate convention is for +V3 up and +V2 to left.
+        Coordinate convention is for +N up and +E to left.
 
         Parameters
         ----------
@@ -623,7 +667,7 @@ class obs_hci(nrc_hci):
             due to being embedded in a disk.
 
         xy : tuple, None
-            (X,Y) position in V2/V3 coordinates of companion.
+            (X,Y) position in sky coordinates of companion (N up, E left).
         rtheta : tuple, None
             Radius and position angle relative to stellar position.
             Alternative to xy keyword
@@ -631,7 +675,7 @@ class obs_hci(nrc_hci):
             What are the spatial units? Valid values are 'AU', 'asec', or 'pix'.
 
         accr : bool
-            Include accretion (default: False)?
+            Include accretion? default: False
         mmdot : float
             From Zhu et al. (2015), the Mjup^2/yr value.
             If set to None then calculated from age and mass.
@@ -698,7 +742,7 @@ class obs_hci(nrc_hci):
         Use info stored in self.planets to create a noiseless slope image
         of just the exoplanets (no star).
 
-        Coordinate convention is for +V3 up and +V2 to left.
+        Coordinate convention is for +N up and +E to left.
 
         Parameters
         ----------
@@ -763,7 +807,7 @@ class obs_hci(nrc_hci):
             delx, dely = (xoff + bar_offpix, yoff)
             if ('FULL' in self.det_info['wind_mode']) and (self.mask is not None):
                 cdict = coron_ap_locs(self.module, self.channel, self.mask, full=True)
-                xcen, ycen = cdict['cen_V23']
+                xcen, ycen = cdict['cen_sci']
                 delx += (xcen - xpix/2)
                 dely += (ycen - ypix/2)
             psf_planet = fshift(psf_planet, delx=delx, dely=dely, pad=True)
@@ -812,7 +856,7 @@ class obs_hci(nrc_hci):
         The PA offset value will rotate the image CCW.
         Image units of e-/sec.
 
-        Coordinate convention is for +V3 up and +V2 to left.
+        Coordinate convention is for N up and E to left.
 
         Parameters
         ----------
@@ -838,13 +882,14 @@ class obs_hci(nrc_hci):
         header = self.disk_hdulist[0].header
         if PA_offset!=0:
             disk_image = rotate(disk_image, -PA_offset, reshape=False, order=1)
+        disk_image = pad_or_cut_to_size(disk_image, image_shape)
 
         # Shift rotated image to location along bar
         delx, dely = (bar_offpix, 0)
         # Shift to position relative to center of image
         if ('FULL' in self.det_info['wind_mode']) and (self.mask is not None):
             cdict = coron_ap_locs(self.module, self.channel, self.mask, full=True)
-            xcen, ycen = cdict['cen_V23']
+            xcen, ycen = cdict['cen_sci']
         else:
             xcen, ycen = (xpix/2, ypix/2)
         delx += (xcen - xpix/2)
@@ -863,9 +908,9 @@ class obs_hci(nrc_hci):
             cmask_temp = cmask.copy()
             if 'FULL' in self.det_info['wind_mode']:
                 #cdict = coron_ap_locs(self.module, self.channel, self.mask, full=True)
-                #xcen, ycen = cdict['cen_V23']
+                #xcen, ycen = cdict['cen_sci']
                 r, th = dist_image(cmask, pixscale=self.pixelscale,
-                                   center=cdict['cen_V23'], return_theta=True)
+                                   center=cdict['cen_sci'], return_theta=True)
                 x_asec, y_asec = rtheta_to_xy(r, th)
                 ind = (np.abs(x_asec)<10) & (np.abs(y_asec)<5)
                 cmask_temp[ind] = 1
@@ -1027,7 +1072,7 @@ class obs_hci(nrc_hci):
         """Make roll-subtracted image.
 
         Create a final roll-subtracted slope image based on current observation
-        settings. Coordinate convention is for +V3 up and +V2 to left.
+        settings. Coordinate convention is for +N up and +E to left.
 
         Procedure:
 
@@ -1099,7 +1144,7 @@ class obs_hci(nrc_hci):
         bar_offpix = self.bar_offset / self.pixelscale
         if ('FULL' in self.det_info['wind_mode']) and (self.mask is not None):
             cdict = coron_ap_locs(self.module, self.channel, self.mask, full=True)
-            xcen, ycen = cdict['cen_V23']
+            xcen, ycen = cdict['cen_sci']
             xcen += bar_offpix
         else:
             xcen, ycen = (xpix/2 + bar_offpix, ypix/2)
@@ -1362,7 +1407,7 @@ class obs_hci(nrc_hci):
         """Make roll-subtracted image.
 
         Create a final roll-subtracted slope image based on current observation
-        settings. Coordinate convention is for +V3 up and +V2 to left.
+        settings. Coordinate convention is for N up and E to left.
 
         Procedure:
 
@@ -1371,10 +1416,10 @@ class obs_hci(nrc_hci):
         - Add noise to all images
         - Scale ref image
         - Subtract ref image from both rolls
-        - De-rotate Roll 1 and Roll 2 to common V2/V3
+        - De-rotate Roll 1 and Roll 2 to common coordinates
         - Average Roll 1 and Roll 2
 
-        Returns an HDUList of final image (V3 rotated upwards).
+        Returns an HDUList of final image (N rotated upwards).
 
         Parameters
         ----------
@@ -1417,16 +1462,17 @@ class obs_hci(nrc_hci):
             Resulting PSFs are slightly less accurate, but much faster.
             Default is True.
         use_cmask : bool
-            Use the coronagraphic mask image to attenuate planet or disk that
-            is obscurred by a corongraphic mask feature.
+            Use the coronagraphic mask image to attenuate planets or disk
+            obscurred by a corongraphic mask feature.
         zfact : float
             Zodiacal background factor (default=2.5)
-        locstr :
-            Object name or RA/DEC (decimal degrees or sexigesimal)
-        year : int
-            Year of observation
-        day : float
-            Day of observation
+        ra : float
+            Right ascension in decimal degrees
+        dec : float
+            Declination in decimal degrees
+        thisday : int
+            Calendar day to use for background calculation.  If not given, will use the
+            average of visible calendar days.
 
         """
 
@@ -1449,7 +1495,7 @@ class obs_hci(nrc_hci):
         bar_offpix = self.bar_offset / self.pixelscale
         if ('FULL' in self.det_info['wind_mode']) and (self.mask is not None):
             cdict = coron_ap_locs(self.module, self.channel, self.mask, full=True)
-            xcen, ycen = cdict['cen_V23']
+            xcen, ycen = cdict['cen_sci']
             xcen += bar_offpix
         else:
             xcen, ycen = (xpix/2 + bar_offpix, ypix/2)
@@ -1506,6 +1552,10 @@ class obs_hci(nrc_hci):
             if oversample != 1:
                 im_roll1 = frebin(im_roll1, scale=oversample)
                 im_roll2 = frebin(im_roll2, scale=oversample)
+            if oversample>1:
+                kernel = Gaussian2DKernel(0.5*oversample)
+                im_roll1 = convolve_fft(im_roll1, kernel, allow_huge=True)
+                im_roll2 = convolve_fft(im_roll2, kernel, allow_huge=True)
 
             diff_r1 = im_roll1 - im_roll2
             diff_r2 = -1 * diff_r1
@@ -1558,7 +1608,11 @@ class obs_hci(nrc_hci):
         if oversample != 1:
             im_ref   = frebin(im_ref, scale=oversample)
             im_roll1 = frebin(im_roll1, scale=oversample)
-
+        if oversample>1:
+            kernel = Gaussian2DKernel(0.5*oversample)
+            im_ref = convolve_fft(im_ref, kernel, allow_huge=True)
+            im_roll1 = convolve_fft(im_roll1, kernel, allow_huge=True)
+                    
         # Telescope Roll 2 with reference subtraction
         if (abs(roll_angle) > eps):
             # Subtraction with and without scaling
@@ -1596,6 +1650,10 @@ class obs_hci(nrc_hci):
             _log.debug('scale2: {0:.3f}'.format(scale2))
             if oversample != 1:
                 im_roll2 = frebin(im_roll2, scale=oversample)
+            if oversample>1:
+                kernel = Gaussian2DKernel(0.5*oversample)
+                im_roll2 = convolve_fft(im_roll2, kernel, allow_huge=True)
+                
             # Subtraction with and without scaling
             im_diff1_r2 = im_roll2 - im_ref
             im_diff2_r2 = im_roll2 - im_ref * scale2
@@ -1771,6 +1829,7 @@ class obs_hci(nrc_hci):
         # Normalize by psf max value
         if no_ref:
             # No reference image subtraction; pure roll subtraction
+            # Generate 2 PSFs separated by roll angle to find self-subtracted PSF peak
 
             off_vals = []
             max_vals = []
@@ -1886,6 +1945,10 @@ class obs_hci(nrc_hci):
     def gen_slope_image(self, PA=0, exclude_disk=False, exclude_planets=False,
         exclude_noise=False, zfact=None, do_ref=False, im_star=None, **kwargs):
         """Create slope image of observation
+        
+        Beware that stellar position (centered on a pixel) will likely not
+        fall in the exact center of the slope image (between pixel borders)
+        because images are generally even while psf_fovs may be odd.
 
         Parameters
         ----------
@@ -1906,6 +1969,7 @@ class obs_hci(nrc_hci):
         im_star : ndarray or None
             Pass a precomputed slope image of the stellar source already
             positioned at it's correct location.
+        
 
         Keyword Args
         ------------
@@ -1917,13 +1981,13 @@ class obs_hci(nrc_hci):
         use_cmask : bool
             Use the coronagraphic mask image to attenuate planet or disk that
             is obscurred by a corongraphic mask feature.
-        locstr :
-            Object name or RA/DEC (decimal degrees or sexigesimal)
-        year : int
-            Year of observation
-        day : float
-            Day of observation
-
+        ra : float
+            Right ascension in decimal degrees
+        dec : float
+            Declination in decimal degrees
+        thisday : int
+            Calendar day to use for background calculation.  If not given, will use the
+            average of visible calendar days.
 
         """
 
@@ -1943,7 +2007,7 @@ class obs_hci(nrc_hci):
         bar_offpix = self.bar_offset / self.pixelscale
         if ('FULL' in self.det_info['wind_mode']) and (self.mask is not None):
             cdict = coron_ap_locs(self.module, self.channel, self.mask, full=True)
-            xcen, ycen = cdict['cen_V23']
+            xcen, ycen = cdict['cen_sci']
             xcen += bar_offpix
         else:
             xcen, ycen = (xpix/2 + bar_offpix, ypix/2)
@@ -2023,13 +2087,13 @@ class obs_hci(nrc_hci):
             is obscurred by a corongraphic mask feature.
         zfact : float
             Zodiacal background factor (default=2.5)
-        locstr :
-            Object name or RA/DEC (decimal degrees or sexigesimal)
-        year : int
-            Year of observation
-        day : float
-            Day of observation
-
+        ra : float
+            Right ascension in decimal degrees
+        dec : float
+            Declination in decimal degrees
+        thisday : int
+            Calendar day to use for background calculation.  If not given, will use the
+            average of visible calendar days.
 
         """
 
@@ -2069,7 +2133,6 @@ class obs_hci(nrc_hci):
 
 class obs_coronagraphy(obs_hci):
     """Deprecated class. Use :class:`obs_hci` instead."""
-    # Turns out the paper is Spiegel & Burrows (2012), not 2011
     def __init__(self, *args, **kwargs):
 
         _log.warning('obs_coronagraphy is depcrecated. Use obs_hci instead.')
@@ -2092,7 +2155,7 @@ def model_to_hdulist(args_model, sp_star, filter_or_bp,
     ----------
     args_model - tuple
         Arguments describing the necessary model information:
-            - fname   : Name of model file
+            - fname   : Name of model file or an HDUList
             - scale0  : Pixel scale (in arcsec/pixel)
             - dist0   : Assumed model distance
             - wave_um : Wavelength of observation
@@ -2135,25 +2198,31 @@ def model_to_hdulist(args_model, sp_star, filter_or_bp,
 
     #### Read in the image, then convert from mJy/arcsec^2 to photons/sec/pixel
 
-    # Open file
-    hdulist = fits.open(fname)
-    #data    = hdulist[0].data#.copy()
-    #header  = hdulist[0].header
-    #hdutemp.close()
+    if isinstance(fname, fits.HDUList):
+        hdulist = deepcopy(fname)
+    else:
+        # Open file
+        hdulist = fits.open(fname)
+        #data    = hdulist[0].data#.copy()
+        #header  = hdulist[0].header
+        #hdutemp.close()
 
     # Break apart units0
     units_list = units0.split('/')
-    if 'Jy' in units_list[0]:
-        units_pysyn = S.units.Jy()
     if 'mJy' in units_list[0]:
         units_pysyn = S.units.mJy()
-    if 'muJy' in units_list[0]:
+    elif 'uJy' in units_list[0]:
         units_pysyn = S.units.muJy()
-    if 'nJy' in units_list[0]:
+    elif 'nJy' in units_list[0]:
         units_pysyn = S.units.nJy()
-    if 'MJy' in units_list[0]:
+    elif 'MJy' in units_list[0]:
         hdulist[0].data *= 1000 # Convert to Jy
         units_pysyn = S.units.Jy()
+    elif 'Jy' in units_list[0]: # Jy should be last
+        units_pysyn = S.units.Jy()
+    else:
+        errstr = "Do not recognize units0='{}'".format(units0)
+        raise ValueError(errstr)
 
     # Convert from input units to photlam (photons/sec/cm^2/A/angular size)
     im = units_pysyn.ToPhotlam(wave0, hdulist[0].data)
@@ -2241,22 +2310,8 @@ def _wrap_convolve_for_mp(args):
 
 def _wrap_conv_trans_for_mp(args):
     """
-    Internal helper routine for parallelizing computations across multiple processors.
-
-    Create a list of arguments to pass to this function:
-        worker_args = [(inst, image, rho, offset_list, i) for i,inst in enumerate(nrc_star_list)]
-
-    Then create a theadpool:
-        pool = mp.Pool(nproc)
-        images = pool.map(_wrap_coeff_for_mp, worker_args)
-        pool.close()
-        images = np.array(images)
-
-    For single processing, just use:
-        images = [_wrap_convolve_for_mp(wa) for wa in worker_args]
-        images = np.array(images)
-
-    For multiprocessing:
+    Similar to `_wrap_convolve_for_mp` except bins data by mask
+    transmission value.
     """
 
     psf, model, tvals_edges, cmask, i = args
@@ -2281,303 +2336,3 @@ def _wrap_conv_trans_for_mp(args):
 
         return res
 
-def plot_contrasts_mjup(curves, nsig, wfe_list, obs=None, age=10,
-    ax=None, colors=None, xr=[0,10], yr=None,
-    twin_ax=False, return_axes=False, **kwargs):
-    """Plot contrast curves
-
-    Plot a series of contrast curves for corresponding WFE drifts.
-
-    Parameters
-    ----------
-    curves : list
-        A list with length corresponding to `wfe_list`. Each list element
-        has three arrays in a tuple: the radius in arcsec, n-sigma contrast,
-        and n-sigma sensitivity limit (vega mag).
-    nsig : float
-        N-sigma limit corresponding to sensitivities/contrasts.
-    wfe_list : array-like
-        List of WFE drift values corresponding to each set of sensitivities
-        in `curves` argument.
-
-    Keyword Args
-    ------------
-    obs : :class:`obs_hci`
-        Corresponding observation class that created the contrast curves.
-        Uses distances and stellar magnitude to plot contrast and AU
-        distances on opposing axes. Also necessary for mjup=True.
-    cond : bool
-        Instead of plotting sensitivities, use COND models to plot the
-        limiting planet masses.
-    age : float
-        Required for plotting limiting planet masses.
-    ax : matplotlib.axes
-        Axes on which to plot curves.
-    colors : None, array-like
-        List of colors for contrast curves. Default is gradient of blues.
-    return_axes : bool
-        Return the matplotlib axes to continue plotting. If `obs` is set,
-        then this returns three sets of axes.
-
-    """
-    if ax is None:
-        fig, ax = plt.subplots()
-    if colors is None:
-        lin_vals = np.linspace(0.2,0.8,len(wfe_list))
-        colors = plt.cm.Blues_r(lin_vals)
-
-    # Grab COND model data
-    tbl = cond_table(age=age)
-    filt = obs.filter
-    mod = obs.module
-    dist = obs.distance
-    mass_data, mag_data = cond_filter(tbl, filt, module=mod, dist=dist)
-    isort = np.argsort(mag_data)
-
-    # Plot the data
-    for j, wfe_ref_drift in enumerate(wfe_list):
-        rr, contrast, mag_sens = curves[j]
-        label='$\Delta$' + "WFE = {} nm".format(wfe_list[j])
-        yvals = np.interp(mag_sens, mag_data[isort], mass_data[isort])
-        ax.plot(rr, yvals, label=label, color=colors[j], zorder=1, lw=2)
-
-    if xr is not None: ax.set_xlim(xr)
-    if yr is not None: ax.set_ylim(yr)
-
-    ax.xaxis.get_major_locator().set_params(nbins=10, steps=[1, 2, 5, 10])
-    ax.yaxis.get_major_locator().set_params(nbins=10, steps=[1, 2, 5, 10])
-
-    ylabel = 'Mass Limits ($M_{\mathrm{Jup}}$)'
-    ax.set_ylabel(ylabel)
-    ax.set_xlabel('Separation (arcsec)')
-
-    if twin_ax:
-        # Plot opposing axes in alternate units
-        ax3 = ax.twiny()
-        xr3 = np.array(ax.get_xlim()) * obs.distance
-        ax3.set_xlim(xr3)
-        ax3.set_xlabel('Separtion (AU)')
-
-        ax3.xaxis.get_major_locator().set_params(nbins=9, steps=[1, 2, 5, 10])
-
-        if return_axes:
-            return (ax, ax3)
-    else:
-        if return_axes:
-            return ax
-
-
-def plot_contrasts(curves, nsig, wfe_list, obs=None, ax=None,
-    colors=None, xr=[0,10], yr=[25,5], return_axes=False):
-    """Plot contrast curves
-
-    Plot a series of contrast curves for corresponding WFE drifts.
-
-    Parameters
-    ----------
-    curves : list
-        A list with length corresponding to `wfe_list`. Each list element
-        has three arrays in a tuple: the radius in arcsec, n-sigma contrast,
-        and n-sigma sensitivity limit (vega mag).
-    nsig : float
-        N-sigma limit corresponding to sensitivities/contrasts.
-    wfe_list : array-like
-        List of WFE drift values corresponding to each set of sensitivities
-        in `curves` argument.
-
-    Keyword Args
-    ------------
-    obs : :class:`obs_hci`
-        Corresponding observation class that created the contrast curves.
-        Uses distances and stellar magnitude to plot contrast and AU
-        distances on opposing axes.
-    ax : matplotlib.axes
-        Axes on which to plot curves.
-    colors : None, array-like
-        List of colors for contrast curves. Default is gradient of blues.
-    return_axes : bool
-        Return the matplotlib axes to continue plotting. If `obs` is set,
-        then this returns three sets of axes.
-
-    """
-    if ax is None:
-        fig, ax = plt.subplots()
-    if colors is None:
-        lin_vals = np.linspace(0.3,0.8,len(wfe_list))
-        colors = plt.cm.Blues_r(lin_vals)
-    for j, wfe_ref_drift in enumerate(wfe_list):
-        rr, contrast, mag_sens = curves[j]
-        label='$\Delta$' + "WFE = {} nm".format(wfe_list[j])
-        ax.plot(rr, mag_sens, label=label, color=colors[j], zorder=1, lw=2)
-
-    if xr is not None: ax.set_xlim(xr)
-    if yr is not None: ax.set_ylim(yr)
-
-
-    ax.xaxis.get_major_locator().set_params(nbins=10, steps=[1, 2, 5, 10])
-    ax.yaxis.get_major_locator().set_params(nbins=10, steps=[1, 2, 5, 10])
-
-    ax.set_ylabel('{:.0f}-$\sigma$ Sensitivities (mag)'.format(nsig))
-    ax.set_xlabel('Separation (arcsec)')
-
-    # Plot opposing axes in alternate units
-    if obs is not None:
-        yr1 = np.array(ax.get_ylim())
-        yr2 = 10**((obs.star_flux('vegamag') - yr1) / 2.5)
-        ax2 = ax.twinx()
-        ax2.set_yscale('log')
-        ax2.set_ylim(yr2)
-        ax2.set_ylabel('{:.0f}-$\sigma$ Contrast'.format(nsig))
-
-        ax3 = ax.twiny()
-        xr3 = np.array(ax.get_xlim()) * obs.distance
-        ax3.set_xlim(xr3)
-        ax3.set_xlabel('Separtion (AU)')
-
-        ax3.xaxis.get_major_locator().set_params(nbins=9, steps=[1, 2, 5, 10])
-
-        if return_axes:
-            return (ax, ax2, ax3)
-    else:
-        if return_axes:
-            return ax
-
-
-def planet_mags(obs, age=10, entropy=13, mass_list=[10,5,2,1], av_vals=[0,25], atmo='hy3s',
-    cond=False, **kwargs):
-    """Exoplanet Magnitudes
-
-    Determine a series of exoplanet magnitudes for given observation.
-    By default, use Spiegel & Burrows 2012 models, but has the option
-    to use the COND models from https://phoenix.ens-lyon.fr/Grids.
-    These are useful because SB12 model grids only ranges from 1-1000 Myr
-    with masses 1-15 MJup.
-    """
-
-    if av_vals is None:
-        av_vals = [0,0]
-
-    pmag = {}
-    for i,m in enumerate(mass_list):
-        flux_list = []
-        for j,av in enumerate(av_vals):
-            sp = obs.planet_spec(mass=m, age=age, Av=av, entropy=entropy, atmo=atmo, **kwargs)
-            sp_obs = S.Observation(sp, obs.bandpass, binset=obs.bandpass.wave)
-            flux = sp_obs.effstim('vegamag')
-            flux_list.append(flux)
-        pmag[m] = tuple(flux_list)
-
-    # Do COND models instead
-    # But still want SB12 models to get A_V information
-    if cond:
-        # COND Table
-        tbl = cond_table(age=age, **kwargs)
-
-        # All mass and mag data for specified filter
-        filt = obs.filter
-        mod = obs.module
-        dist = obs.distance
-        mass_data, mag_data = cond_filter(tbl, filt, module=mod, dist=dist)
-
-        # Mag information for the requested masses
-        mags0 = np.interp(mass_list, mass_data, mag_data)
-
-        # Apply extinction
-        for i, m in enumerate(mass_list):
-            if np.allclose(av_vals, 0):
-                dm = np.array([0,0])
-            else:
-                #SB12 at A_V=0
-                sp = obs.planet_spec(mass=m, age=age, Av=0, entropy=entropy, atmo=atmo, **kwargs)
-                sp_obs = S.Observation(sp, obs.bandpass, binset=obs.bandpass.wave)
-                sb12_mag = sp_obs.effstim('vegamag')
-
-                # Get magnitude offset due to extinction
-                dm = np.array(pmag[m]) - sb12_mag
-                dm2 = pmag[m][1] - sb12_mag
-
-            # Apply extinction to COND models
-            pmag[m] = tuple(mags0[i] + dm)
-
-    return pmag
-
-import matplotlib.patches as mpatches
-def plot_planet_patches(ax, obs, age=10, entropy=13, mass_list=[10,5,2,1], av_vals=[0,25],
-    cols=None, **kwargs):
-    """Plot exoplanet magnitudes in region corresponding to extinction values."""
-
-    xlim = ax.get_xlim()
-
-
-    #lin_vals = np.linspace(0,0.5,4)
-    #cols = plt.cm.Purples_r(lin_vals)[::-1]
-    if cols is None:
-        cols = plt.cm.tab10(np.linspace(0,1,10))
-
-    dist = obs.distance
-
-    if entropy<8: entropy=8
-    if entropy>13: entropy=13
-
-    pmag = planet_mags(obs, age, entropy, mass_list, av_vals, **kwargs)
-    for i,m in enumerate(mass_list):
-        label = 'Mass = {} '.format(m) + '$M_{\mathrm{Jup}}$'
-        if av_vals is None:
-            ax.plot(xlim, pmag[m], color=cols[i], lw=1, ls='--', label=label)
-        else:
-            pm_min, pm_max = pmag[m]
-            rect = mpatches.Rectangle((xlim[0], pm_min), xlim[1], pm_max-pm_min,
-                                     alpha=0.2, color=cols[i], label=label, zorder=2)
-            ax.add_patch(rect)
-            ax.plot(xlim, [pm_min]*2, color=cols[i], lw=1, alpha=0.3)
-            ax.plot(xlim, [pm_max]*2, color=cols[i], lw=1, alpha=0.3)
-
-    entropy_switch = {13:'Hot', 8:'Cold'}
-    entropy_string = entropy_switch.get(entropy, "Warm")
-    ent_str = entropy_string + ' Start'
-
-    if av_vals is None:
-        av_str = ''
-    else:
-        av_str = ' ($A_V = [{:.0f},{:.0f}]$)'.format(av_vals[0],av_vals[1])
-    #age_str = 'Age = {:.0f} Myr; '.format(age)
-    #dist_str = 'Dist = {:.1f} pc; '.format(dist) if dist is not None else ''
-    #dist_str=""
-
-    #ax.set_title('{} -- {} ({}{}{})'.format(obs.filter,ent_str,age_str,dist_str,av_str))
-
-    #ax.set_title('{} -- {}{}'.format(obs.filter,ent_str,av_str))
-
-
-def plot_hdulist(hdulist, xr=None, yr=None, ax=None, return_ax=False,
-    cmap=None, scale='linear', vmin=None, vmax=None, axes_color='white'):
-
-    from webbpsf import display_psf
-
-    if ax is None:
-        fig, ax = plt.subplots()
-    if cmap is None:
-        cmap = matplotlib.rcParams['image.cmap']
-
-    data = hdulist[0].data
-    if vmax is None:
-        vmax = 0.75 * np.nanmax(data) if scale=='linear' else vmax
-    if vmin is None:
-        vmin = 0 if scale=='linear' else vmax/1e6
-
-    ax, cb = display_psf(hdulist, ax=ax, title='', colorbar=True, cmap=cmap,
-                         scale=scale, vmin=vmin, vmax=vmax, return_ax=True)
-    cb.set_label('counts/sec')
-
-    ax.set_xlim(xr)
-    ax.set_ylim(yr)
-    ax.set_xlabel('Arcsec')
-    ax.set_ylabel('Arcsec')
-
-
-    ax.tick_params(axis='both', color=axes_color, which='both')
-    for k in ax.spines.keys():
-        ax.spines[k].set_color(axes_color)
-
-    ax.xaxis.get_major_locator().set_params(nbins=9, steps=[1, 2, 5, 10])
-    ax.yaxis.get_major_locator().set_params(nbins=9, steps=[1, 2, 5, 10])

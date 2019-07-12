@@ -14,13 +14,6 @@ _log = logging.getLogger('pynrc')
 from poppy.utils import krebin
 
 from pynrc.maths.coords import dist_image
-#from pynrc.nrc_utils import (hist_indices, binned_statistics)
-#    igroups = hist_indices(rho_good, bins)
-#    nbins = len(igroups)
-
-    # Standard deviation for each bin
-#    std1 = binned_statistic(igroups, diff1_good, func=std_func)
-
 
 from scipy.optimize import least_squares#, leastsq
 from scipy.ndimage import fourier_shift
@@ -154,12 +147,9 @@ def fshift(image, delx=0, dely=0, pad=False, cval=0.0):
         Otherwise, the image is wrapped.
     cval : sequence or float, optional
         The values to set the padded values for each axis. Default is 0.
-        ((before_1, after_1), ... (before_N, after_N)) unique pad constants
-        for each axis.
-        ((before, after),) yields same before and after constants for each
-        axis.
-        (constant,) or int is a shortcut for before = after = constant for
-        all axes.
+        ((before_1, after_1), ... (before_N, after_N)) unique pad constants for each axis.
+        ((before, after),) yields same before and after constants for each axis.
+        (constant,) or int is a shortcut for before = after = constant for all axes.
 
         
     Returns
@@ -262,7 +252,7 @@ def fshift(image, delx=0, dely=0, pad=False, cval=0.0):
                           
                           
                           
-def fourier_imshift(image, xshift, yshift, pad=False):
+def fourier_imshift(image, xshift, yshift, pad=False, cval=0.0):
     """Fourier shift image
     
     Shift an image by use of Fourier shift theorem
@@ -272,12 +262,17 @@ def fourier_imshift(image, xshift, yshift, pad=False):
     image : nd array
         N x K image
     xshift : float
-        Pixel value by which to shift image in the x direction
+        Number of pixels to shift image in the x direction
     yshift : float
-        Pixel value by which to shift image in the y direction
+        Number of pixels to shift image in the y direction
     pad : bool
         Should we pad the array before shifting, then truncate?
         Otherwise, the image is wrapped.
+    cval : sequence or float, optional
+        The values to set the padded values for each axis. Default is 0.
+        ((before_1, after_1), ... (before_N, after_N)) unique pad constants for each axis.
+        ((before, after),) yields same before and after constants for each axis.
+        (constant,) or int is a shortcut for before = after = constant for all axes.
 
     Returns
     -------
@@ -290,7 +285,7 @@ def fourier_imshift(image, xshift, yshift, pad=False):
         padx = np.abs(np.int(xshift)) + 1
         pady = np.abs(np.int(yshift)) + 1
         pad_vals = ([pady]*2,[padx]*2)
-        im = np.pad(image,pad_vals,'constant')
+        im = np.pad(image,pad_vals,'constant',constant_values=cval)
     else:
         padx = 0; pady = 0
         im = image
@@ -667,8 +662,7 @@ def scale_ref_image(im1, im2, mask=None, smooth_imgs=False,
     """Reference image scaling
     
     Find value to scale a reference image by minimizing residuals.
-    This assumed everything is already aligned if 
-    return_shift_values=False.
+    Assumes everything is already aligned if return_shift_values=False.
     
     Or simply turn on return_shift_values to return (dx,dy,scl). 
     Then fshift(im2,dx,dy) to shift the reference image.
@@ -713,35 +707,35 @@ def scale_ref_image(im1, im2, mask=None, smooth_imgs=False,
         _, _, scl = align_LSQ(im2[mask], im1[mask], shift_function=None)
         return scl
 
-###     ind = np.where(im1==im1[mask].max())
-###     ind = [ind[0][0], ind[1][0]]
-### 
-###     # Initial Guess
-###     scl = np.nanmean(im1[ind[0]-3:ind[0]+3,ind[1]-3:ind[1]+3]) / \
-###           np.nanmean(im2[ind[0]-3:ind[0]+3,ind[1]-3:ind[1]+3])
-###           
-###     # Wider range
-###     # Check a range of scale values
-###     # Want to minimize the standard deviation of the differenced images
-###     scl_arr = np.linspace(0.2*scl,2*scl,10)
-###     mad_arr = []
-###     for val in scl_arr:
-###         diff = im1 - val*im2
-###         mad_arr.append(robust.medabsdev(diff[mask]))
-###     mad_arr = np.array(mad_arr)
-###     scl = scl_arr[mad_arr==mad_arr.min()][0]
-### 
-###     # Check a range of scale values
-###     # Want to minimize the standard deviation of the differenced images
-###     scl_arr = np.linspace(0.85*scl,1.15*scl,50)
-###     mad_arr = []
-###     for val in scl_arr:
-###         diff = im1 - val*im2
-###         mad_arr.append(robust.medabsdev(diff[mask]))
-###     mad_arr = np.array(mad_arr)
-### 
-###     #plt.plot(scl_arr,mad_arr)
-###     return scl_arr[mad_arr==mad_arr.min()][0]
+    # ind = np.where(im1==im1[mask].max())
+    # ind = [ind[0][0], ind[1][0]]
+
+    # # Initial Guess
+    # scl = np.nanmean(im1[ind[0]-3:ind[0]+3,ind[1]-3:ind[1]+3]) / \
+    #       np.nanmean(im2[ind[0]-3:ind[0]+3,ind[1]-3:ind[1]+3])
+          
+    # # Wider range
+    # # Check a range of scale values
+    # # Want to minimize the standard deviation of the differenced images
+    # scl_arr = np.linspace(0.2*scl,2*scl,10)
+    # mad_arr = []
+    # for val in scl_arr:
+    #     diff = im1 - val*im2
+    #     mad_arr.append(robust.medabsdev(diff[mask]))
+    # mad_arr = np.array(mad_arr)
+    # scl = scl_arr[mad_arr==mad_arr.min()][0]
+
+    # # Check a range of scale values
+    # # Want to minimize the standard deviation of the differenced images
+    # scl_arr = np.linspace(0.85*scl,1.15*scl,50)
+    # mad_arr = []
+    # for val in scl_arr:
+    #     diff = im1 - val*im2
+    #     mad_arr.append(robust.medabsdev(diff[mask]))
+    # mad_arr = np.array(mad_arr)
+
+    # #plt.plot(scl_arr,mad_arr)
+    # return scl_arr[mad_arr==mad_arr.min()][0]
 
 
 def optimal_difference(im_sci, im_ref, scale, binsize=1, center=None, 
@@ -830,8 +824,8 @@ def hist_indices(values, bins=10, return_more=False):
     This function bins an input of values and returns the indices for
     each bin. This is similar to the reverse indices functionality
     of the IDL histogram routine. It's also much faster than doing
-    a for loop and creating masks/indice at each iteration, because
-    we utilize a sparse matrix constructor. It's kinda magical...
+    a for loop and creating masks/indices at each iteration, because
+    we utilize a sparse matrix constructor. 
     
     Returns a list of indices grouped together according to the bin.
     Only works for evenly spaced bins.
@@ -844,6 +838,7 @@ def hist_indices(values, bins=10, return_more=False):
         If bins is an int, it defines the number of equal-width bins 
         in the given range (10, by default). If bins is a sequence, 
         it defines the bin edges, including the rightmost edge.
+        In the latter case, the bins must encompass all values.
     return_more : bool
         Option to also return the values organized by bin and 
         the value of the centers (igroups, vgroups, center_vals).
@@ -852,12 +847,12 @@ def hist_indices(values, bins=10, return_more=False):
     -------
     Find the standard deviation at each radius of an image
     
-    >>> rho = dist_image(image)
-    >>> binsize = 1
-    >>> bins = np.arange(rho.min(), rho.max() + binsize, binsize)
-    >>> igroups, vgroups, center_vals = hist_indices(rho, bins, True)
-    >>> # Get the standard deviation of each bin in image
-    >>> std = binned_statistic(igroups, image, func=np.std)
+        >>> rho = dist_image(image)
+        >>> binsize = 1
+        >>> bins = np.arange(rho.min(), rho.max() + binsize, binsize)
+        >>> igroups, vgroups, center_vals = hist_indices(rho, bins, True)
+        >>> # Get the standard deviation of each bin in image
+        >>> std = binned_statistic(igroups, image, func=np.std)
 
     """
     
@@ -879,6 +874,8 @@ def hist_indices(values, bins=10, return_more=False):
     center_vals = bins[:-1] + binsize / 2.
     nbins = center_vals.size
 
+    # TODO: If input bins is an array that doesn't span the full set of input values,
+    # then we need to set a warning.
     digitized = ((nbins-1.0) / (v1-v0) * (values_flat-v0)).astype(np.int)
     csr = csr_matrix((values_flat, [digitized, np.arange(N)]), shape=(nbins, N))
 
@@ -917,10 +914,10 @@ def binned_statistic(x, values, func=np.mean, bins=10):
     -------
     Find the standard deviation at each radius of an image
     
-    >>> rho = dist_image(image)
-    >>> binsize = 1
-    >>> radial_bins = np.arange(rho.min(), rho.max() + binsize, binsize)
-    >>> radial_stds = binned_statistic(rho, image, func=np.std, bins=radial_bins)
+        >>> rho = dist_image(image)
+        >>> binsize = 1
+        >>> radial_bins = np.arange(rho.min(), rho.max() + binsize, binsize)
+        >>> radial_stds = binned_statistic(rho, image, func=np.std, bins=radial_bins)
     
     """
 
