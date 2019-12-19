@@ -184,7 +184,8 @@ class DetectorOps(det_timing):
         """Detector channel 'SW' or 'LW' (inferred from detector ID)"""
         return 'LW' if self.detid.endswith('5') else 'SW'
 
-    def pixel_noise(self, fsrc=0.0, fzodi=0.0, fbg=0.0, verbose=False, **kwargs):
+    def pixel_noise(self, fsrc=0.0, fzodi=0.0, fbg=0.0, rn=None, ktc=None, idark=None,
+        p_excess=None, ng=None, verbose=False, **kwargs):
         """Noise values per pixel.
         
         Return theoretical noise calculation for the specified MULTIACCUM exposure 
@@ -196,17 +197,36 @@ class DetectorOps(det_timing):
 
         Parameters
         ----------
-        fsrc : float
+        fsrc : float or image
             Flux of source in e-/sec/pix
-        fzodi : float
+        fzodi : float or image
             Flux of the zodiacal background in e-/sec/pix
-        fbg : float
+        fbg : float or image
             Flux of telescope background in e-/sec/pix
+        idark : float or image
+            Option to specify dark current in e-/sec/pix.
+        rn : float
+            Option to specify Read Noise per pixel (e-).
+        ktc : float
+            Option to specify kTC noise (in e-). Only valid for single frame (n=1)
+        p_excess : array-like
+            Optional. An array or list of two elements that holds the parameters
+            describing the excess variance observed in effective noise plots.
+            By default these are both 0. For NIRCam detectors, recommended
+            values are [1.0,5.0] for SW and [1.5,10.0] for LW.
+        ng : None or int or image
+            Option to explicitly states number of groups. This is specifically
+            used to enable the ability of only calculating pixel noise for
+            unsaturated groups for each pixel. If a numpy array, then it should
+            be the same shape as `fsrc` image. By default will use `self.ngroup`.
+        verbose : bool
+            Print out results at the end.
+
+        Keyword Arguments
+        -----------------
         ideal_Poisson : bool
             If set to True, use total signal for noise estimate,
             otherwise MULTIACCUM equation is used.
-        verbose : bool
-            Print out results at the end.
 
         Notes
         -----
@@ -217,10 +237,21 @@ class DetectorOps(det_timing):
         """
 
         ma = self.multiaccum
+        if ng is None:
+            ng = ma.ngroup
+        if rn is None:
+            rn = self.read_noise
+        if ktc is None:
+            ktc = self.ktc
+        if p_excess is None:
+            p_excess = self.p_excess
+        if idark is None:
+            idark = self.dark_current
+
         # Pixel noise per ramp (e-/sec/pix)
-        pn = pix_noise(ma.ngroup, ma.nf, ma.nd2, tf=self.time_frame, \
-                       rn=self.read_noise, ktc=self.ktc, p_excess=self.p_excess, \
-                       idark=self.dark_current, fsrc=fsrc, fzodi=fzodi, fbg=fbg, **kwargs)
+        pn = pix_noise(ng, ma.nf, ma.nd2, tf=self.time_frame, 
+                       rn=rn, ktc=ktc, p_excess=p_excess, 
+                       idark=idark, fsrc=fsrc, fzodi=fzodi, fbg=fbg, **kwargs)
 
         # Divide by sqrt(Total Integrations)
         final = pn / np.sqrt(ma.nint)
@@ -277,6 +308,8 @@ class NIRCam(object):
         Specify which coronagraphic occulter (default: None).
     module : str
         NIRCam Module 'A' or 'B' (default: 'A').
+    apname : str
+        Use SIAF aperture name insted of pupil, mask, module, etc.
     ND_acq : bool
         ND square acquisition (default: False).
     ice_scale : float
@@ -423,6 +456,8 @@ class NIRCam(object):
         # Specify ice and nvr scalings
         self._ice_scale = kwargs['ice_scale'] if 'ice_scale' in kwargs.keys() else None
         self._nvr_scale = kwargs['nvr_scale'] if 'nvr_scale' in kwargs.keys() else None
+        self._ote_scale = kwargs['ote_scale'] if 'ote_scale' in kwargs.keys() else None
+        self._nc_scale = kwargs['nc_scale'] if 'nc_scale' in kwargs.keys() else None
 
         # Let's figure out what keywords the user has set and try to 
         # interpret what he/she actually wants. If certain values have
@@ -610,7 +645,8 @@ class NIRCam(object):
         """Update bandpass based on filter, pupil, and module, etc."""
         self._bandpass = read_filter(self._filter, self._pupil, self._mask, 
                                      self.module, self.ND_acq,
-                                     ice_scale=self._ice_scale, nvr_scale=self._nvr_scale)
+                                     ice_scale=self._ice_scale, nvr_scale=self._nvr_scale,
+                                     ote_scale=self._ote_scale, nc_scale=self._nc_scale)
 
     def plot_bandpass(self, ax=None, color=None, title=None, **kwargs):
         """
@@ -690,11 +726,16 @@ class NIRCam(object):
         """Science Instrument aperture info class"""
         return self._siaf_ap
         
+    @property
+    def siaf_ap_names(self):
+        """Give all possible SIAF aperture names"""
+        return list(self.siaf_nrc.apernames)
+        
     def update_from_SIAF(self, apname, pupil=None, **kwargs):
         """Update detector properties based on SIAF aperture"""
 
-        allap = list(self.siaf_nrc.apernames)
-        if not (apname in allap):
+        #allap = list(self.siaf_nrc.apernames)
+        if not (apname in self.siaf_ap_names):
             _log.warning('Cannot find {} in siaf.apernames list.'.format(apname))
             return
             
@@ -1238,6 +1279,33 @@ class NIRCam(object):
         self._psf_coeff = psf_coeff(self.bandpass, self.pupil, self.mask, self.module, 
             **self._psf_info)
 
+        # WFE Drift is handled differently than the rest of the parameters
+        # This is because we use wfed_coeff() to determine the resid values
+        # for the PSF coefficients to generate a drifted PSF.
+        if wfe_drift is not None:
+            self._wfe_drift = wfe_drift
+            
+        wfe_drift = self._wfe_drift
+        if wfe_drift>0:
+            _log.info('Updating WFE drift ({}nm) for fov_pix={} and oversample={}'.\
+                      format(wfe_drift,fov_pix,oversample))
+            wfe_kwargs = dict(self._psf_info)
+            wfe_kwargs['pupil']  = self._pupil
+            wfe_kwargs['mask']   = self._mask
+            wfe_kwargs['module'] = self.module
+#             if self._bar_wfe_val is None:
+#                 wfe_kwargs['bar_offset'] = self.bar_offset
+#             else:
+#                 wfe_kwargs['bar_offset'] = self._bar_wfe_val
+            wfe_kwargs['bar_offset'] = 0
+            #del wfe_kwargs['save'], wfe_kwargs['force']
+
+            wfe_cf = wfed_coeff(self.bandpass, **wfe_kwargs)
+            cf_fit = wfe_cf.reshape([wfe_cf.shape[0], -1])
+            cf_mod = jl_poly(np.array([wfe_drift]), cf_fit)
+            cf_mod = cf_mod.reshape(self._psf_coeff.shape)
+            self._psf_coeff += cf_mod
+            
         # Bar masks can have offsets
         if (self.mask is not None) and ('WB' in self.mask):
             r_bar, th_bar = self.offset_bar(self._filter, self.mask)
@@ -1266,33 +1334,7 @@ class NIRCam(object):
         else:
             self._bar_offset = 0
 
-        # WFE Drift is handled differently than the rest of the parameters
-        # This is because we use wfed_coeff() to determine the resid values
-        # for the PSF coefficients to generate a drifted PSF.
-        if wfe_drift is not None:
-            self._wfe_drift = wfe_drift
-            
-        wfe_drift = self._wfe_drift
-        if wfe_drift>0:
-            _log.info('Updating WFE drift ({}nm) for fov_pix={} and oversample={}'.\
-                      format(wfe_drift,fov_pix,oversample))
-            wfe_kwargs = dict(self._psf_info)
-            wfe_kwargs['pupil']  = self._pupil
-            wfe_kwargs['mask']   = self._mask
-            wfe_kwargs['module'] = self.module
-            if self._bar_wfe_val is None:
-                wfe_kwargs['bar_offset'] = self.bar_offset
-            else:
-                wfe_kwargs['bar_offset'] = self._bar_wfe_val
-            #del wfe_kwargs['save'], wfe_kwargs['force']
 
-            wfe_cf = wfed_coeff(self.bandpass, **wfe_kwargs)
-            cf_fit = wfe_cf.reshape([wfe_cf.shape[0], -1])
-            cf_mod = jl_poly(np.array([wfe_drift]), cf_fit)
-            cf_mod = cf_mod.reshape(self._psf_coeff.shape)
-            self._psf_coeff += cf_mod
-            
-    
         # If there is a coronagraphic spot or bar, then we may need to
         # generate another background PSF for sensitivity information.
         # It's easiest just to ALWAYS do a small footprint without the
@@ -1415,7 +1457,7 @@ class NIRCam(object):
             fov_pix_over = trim_psf * kwargs['oversample']
             coeff = []
             for im in psf_coeff:
-                im = fshift(im, xsh, ysh)
+                im = fshift(im, -xsh, -ysh)
                 im = pad_or_cut_to_size(im, (fov_pix_over,fov_pix_over))
                 coeff.append(im)
             psf_coeff = np.array(coeff)
@@ -1567,7 +1609,7 @@ class NIRCam(object):
 
         return fzodi_pix
         
-    def saturation_levels(self, sp, full_size=True, ngroup=2, **kwargs):
+    def saturation_levels(self, sp, full_size=True, ngroup=2, image=None, **kwargs):
         """Saturation levels.
         
         Create image showing level of saturation for each pixel.
@@ -1589,6 +1631,9 @@ class NIRCam(object):
             which is the very first frame that is read-out and saved 
             separately. This is the equivalent to ngroup=1 for RAPID
             and BRIGHT1 observations.
+        image : ndarray
+            Rather than generating an image on the fly, pass a pre-computed
+            slope image. Overrides `sp` and `full_size`
         
         """
         
@@ -1611,7 +1656,7 @@ class NIRCam(object):
         if t_sat>t_int:
             _log.warning('ngroup*t_group is greater than t_int.')
     
-        # Slope image of input source
+        # Slope image of input 
         if image is not None:
             return image * t_sat / self.well_level
         else:
@@ -1817,6 +1862,7 @@ class NIRCam(object):
         # Create times indicating start of new ramp
         t0 = datetime.datetime.now()
         time_list = [t0] # First ramp time start
+        nint = self.multiaccum.nint
         if nint>1: # Second ramp time start
             dt = self.multiaccum_times['t_int_tot1'] if timeFileNames == True else 0
             time_list.append(time_list[0] + datetime.timedelta(seconds=dt))
